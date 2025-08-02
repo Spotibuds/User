@@ -16,89 +16,338 @@ public class UsersController : ControllerBase
         _context = context;
     }
 
-    [HttpGet]
+    [HttpGet("health")]
+    public ActionResult<string> Health()
+    {
+        return Ok("User service is running!");
+    }
+
+
+
+    [HttpPost("sync-users")]
+    public async Task<ActionResult<string>> SyncUsersFromIdentity()
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        try
+        {
+            // Get users from Identity service
+            using var httpClient = new HttpClient();
+            httpClient.BaseAddress = new Uri("http://localhost:5001/");
+            
+            var identityUsersResponse = await httpClient.GetAsync("api/auth/users");
+            
+            if (!identityUsersResponse.IsSuccessStatusCode)
+            {
+                var errorContent = await identityUsersResponse.Content.ReadAsStringAsync();
+                return StatusCode(500, $"Failed to get users from Identity service. Status: {identityUsersResponse.StatusCode}");
+            }
+
+            var identityUsersJson = await identityUsersResponse.Content.ReadAsStringAsync();
+
+            // Parse the JSON response from Identity service
+            var identityUsers = System.Text.Json.JsonSerializer.Deserialize<List<IdentityUserDto>>(identityUsersJson);
+            
+            if (identityUsers == null || !identityUsers.Any())
+            {
+                return Ok("No users found in Identity service");
+            }
+
+            // Convert Identity users to User service users
+            var usersToCreate = identityUsers.Select(identityUser => new Models.User
+            {
+                IdentityUserId = identityUser.Id,
+                UserName = identityUser.UserName ?? "Unknown",
+                DisplayName = identityUser.UserName ?? "Unknown",
+                Bio = null,
+                AvatarUrl = null,
+                IsPrivate = identityUser.IsPrivate ?? false,
+                Playlists = new List<PlaylistReference>(),
+                FollowedUsers = new List<UserReference>(),
+                Followers = new List<UserReference>(),
+                CreatedAt = identityUser.CreatedAt ?? DateTime.UtcNow
+            }).ToList();
+
+            var createdCount = 0;
+            var skippedCount = 0;
+
+            foreach (var user in usersToCreate)
+            {
+                try
+                {
+                    // Check if user already exists by IdentityUserId (avoiding the ObjectId issue)
+                    var filter = Builders<Models.User>.Filter.Eq(u => u.IdentityUserId, user.IdentityUserId);
+                    var existingUser = await _context.Users.Find(filter).FirstOrDefaultAsync();
+
+                    if (existingUser == null)
+                    {
+                        // Create new user
+                        await _context.Users.InsertOneAsync(user);
+                        createdCount++;
+                    }
+                    else
+                    {
+                        skippedCount++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Log error but continue processing other users
+                }
+            }
+
+            var totalUsers = await _context.Users.CountDocumentsAsync(_ => true);
+            return Ok($"Sync completed! Created {createdCount} new users, skipped {skippedCount} existing users. Total users in database: {totalUsers}");
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error syncing users: {ex.Message}");
+        }
+    }
+
+        [HttpGet("all")]
     public async Task<ActionResult<IEnumerable<UserDto>>> GetUsers()
     {
-        var users = await _context.Users
-            .Find(_ => true)
-            .ToListAsync();
-
-        var userDtos = users.Select(u => new UserDto
+                if (!_context.IsConnected || _context.Users == null)
         {
-            Id = u.Id,
-            IdentityUserId = u.IdentityUserId,
-            UserName = u.UserName,
-            Playlists = u.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
-            FollowedUsers = u.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
-            Followers = u.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-            IsPrivate = u.IsPrivate,
-            CreatedAt = u.CreatedAt
-        }).ToList();
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
 
-        return Ok(userDtos);
+        const int maxRetries = 3;
+        var retryCount = 0;
+
+        while (retryCount < maxRetries)
+        {
+            try
+            {
+                var users = await _context.Users
+                    .Find(_ => true)
+                    .ToListAsync();
+
+                var userDtos = users.Select(u => new UserDto
+                {
+                    Id = u.Id,
+                    IdentityUserId = u.IdentityUserId,
+                    UserName = u.UserName,
+                    DisplayName = u.DisplayName,
+                    Bio = u.Bio,
+                    AvatarUrl = u.AvatarUrl,
+                    Playlists = u.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
+                    FollowedUsers = u.FollowedUsers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
+                    Followers = u.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
+                    IsPrivate = u.IsPrivate,
+                    CreatedAt = u.CreatedAt
+                }).ToList();
+
+                return Ok(userDtos);
+            }
+            catch (MongoDB.Driver.MongoConnectionException ex)
+            {
+                retryCount++;
+                
+                if (retryCount >= maxRetries)
+                {
+                    return StatusCode(503, "Database connection failed. Please try again later.");
+                }
+                
+                // Wait before retrying
+                await Task.Delay(1000 * retryCount);
+            }
+            catch (System.TimeoutException ex)
+            {
+                retryCount++;
+                
+                if (retryCount >= maxRetries)
+                {
+                    return StatusCode(503, "Database connection failed. Please try again later.");
+                }
+                
+                // Wait before retrying
+                await Task.Delay(1000 * retryCount);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, "Internal server error");
+            }
+        }
+
+        return StatusCode(503, "Database connection failed after multiple attempts. Please try again later.");
     }
 
     [HttpGet("identity/{identityUserId}")]
     public async Task<ActionResult<UserDto>> GetUserByIdentityId(string identityUserId)
     {
-        var user = await _context.Users
-            .Find(u => u.IdentityUserId == identityUserId)
-            .FirstOrDefaultAsync();
-
-        if (user == null)
+        if (!_context.IsConnected || _context.Users == null)
         {
-            return NotFound();
+            return StatusCode(503, "Service unavailable - database connection failed");
         }
 
-        var userDto = new UserDto
+        try
         {
-            Id = user.Id,
-            IdentityUserId = user.IdentityUserId,
-            UserName = user.UserName,
-            Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
-            FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
-            Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-            IsPrivate = user.IsPrivate,
-            CreatedAt = user.CreatedAt
-        };
+            var user = await _context.Users
+                .Find(u => u.IdentityUserId == identityUserId)
+                .FirstOrDefaultAsync();
 
-        return Ok(userDto);
+            if (user == null)
+            {
+                return NotFound($"User with identity ID '{identityUserId}' not found");
+            }
+
+            var userDto = new UserDto
+            {
+                Id = user.Id,
+                IdentityUserId = user.IdentityUserId,
+                UserName = user.UserName,
+                DisplayName = user.DisplayName,
+                Bio = user.Bio,
+                AvatarUrl = user.AvatarUrl,
+                Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
+                FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
+                Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
+                IsPrivate = user.IsPrivate,
+                CreatedAt = user.CreatedAt
+            };
+
+            return Ok(userDto);
+        }
+        catch (MongoDB.Driver.MongoConnectionException)
+        {
+            return StatusCode(503, "Database connection failed. Please try again later.");
+        }
+        catch (Exception)
+        {
+            return StatusCode(500, "Internal server error");
+        }
     }
 
     [HttpGet("{id}")]
     public async Task<ActionResult<UserDto>> GetUser(string id)
     {
-        var user = await _context.Users
-            .Find(u => u.Id == id)
-            .FirstOrDefaultAsync();
-
-        if (user == null)
+        if (!_context.IsConnected || _context.Users == null)
         {
-            return NotFound();
+            return StatusCode(503, "Service unavailable - database connection failed");
         }
 
-        var userDto = new UserDto
+        try
         {
-            Id = user.Id,
-            IdentityUserId = user.IdentityUserId,
-            UserName = user.UserName,
-            Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
-            FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
-            Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-            IsPrivate = user.IsPrivate,
-            CreatedAt = user.CreatedAt
-        };
+            var user = await _context.Users
+                .Find(u => u.IdentityUserId == id)
+                .FirstOrDefaultAsync();
+            
+            if (user == null)
+            {
+                return NotFound($"User with id '{id}' not found");
+            }
 
-        return Ok(userDto);
+            var userDto = new UserDto
+            {
+                Id = user.Id,
+                IdentityUserId = user.IdentityUserId,
+                UserName = user.UserName,
+                DisplayName = user.DisplayName,
+                Bio = user.Bio,
+                AvatarUrl = user.AvatarUrl,
+                Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
+                FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
+                Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
+                IsPrivate = user.IsPrivate,
+                CreatedAt = user.CreatedAt
+            };
+
+            return Ok(userDto);
+        }
+        catch (MongoDB.Driver.MongoConnectionException)
+        {
+            return StatusCode(503, "Database connection failed. Please try again later.");
+        }
+        catch (Exception)
+        {
+            return StatusCode(500, "Internal server error");
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+    [HttpGet("search")]
+    public async Task<ActionResult<List<UserDto>>> SearchUsers(string q = "", int page = 1, int pageSize = 20)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(q))
+            {
+                return Ok(new List<UserDto>());
+            }
+
+            var queryLower = q.ToLower();
+            
+            // Search users by username or display name
+            var users = await _context.Users
+                .Find(u => 
+                    u.UserName.ToLower().Contains(queryLower) || 
+                    (u.DisplayName != null && u.DisplayName.ToLower().Contains(queryLower))
+                )
+                .Skip((page - 1) * pageSize)
+                .Limit(pageSize)
+                .ToListAsync();
+
+            var userDtos = users.Select(user => new UserDto
+            {
+                Id = user.Id,
+                IdentityUserId = user.IdentityUserId,
+                UserName = user.UserName,
+                DisplayName = user.DisplayName,
+                Bio = user.Bio,
+                AvatarUrl = user.AvatarUrl,
+                Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
+                FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
+                Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
+                IsPrivate = user.IsPrivate,
+                CreatedAt = user.CreatedAt
+            }).ToList();
+
+            return Ok(userDtos);
+        }
+        catch (MongoDB.Driver.MongoConnectionException)
+        {
+            return StatusCode(503, "Database connection failed. Please try again later.");
+        }
+        catch (Exception)
+        {
+            return StatusCode(500, "Error searching users");
+        }
     }
 
     [HttpPost]
     public async Task<ActionResult<UserDto>> CreateUser(CreateUserDto dto)
     {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
         var user = new Models.User
         {
             IdentityUserId = dto.IdentityUserId,
             UserName = dto.UserName,
+            DisplayName = dto.DisplayName,
+            Bio = dto.Bio,
+            AvatarUrl = dto.AvatarUrl,
             IsPrivate = dto.IsPrivate
         };
 
@@ -109,6 +358,9 @@ public class UsersController : ControllerBase
             Id = user.Id,
             IdentityUserId = user.IdentityUserId,
             UserName = user.UserName,
+            DisplayName = user.DisplayName,
+            Bio = user.Bio,
+            AvatarUrl = user.AvatarUrl,
             Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
             FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
             Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
@@ -122,11 +374,25 @@ public class UsersController : ControllerBase
     [HttpPut("{id}")]
     public async Task<IActionResult> UpdateUser(string id, UpdateUserDto dto)
     {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
         var updateDefinition = Builders<Models.User>.Update
             .Set(u => u.UpdatedAt, DateTime.UtcNow);
 
         if (!string.IsNullOrEmpty(dto.UserName))
             updateDefinition = updateDefinition.Set(u => u.UserName, dto.UserName);
+
+        if (!string.IsNullOrEmpty(dto.DisplayName))
+            updateDefinition = updateDefinition.Set(u => u.DisplayName, dto.DisplayName);
+
+        if (!string.IsNullOrEmpty(dto.Bio))
+            updateDefinition = updateDefinition.Set(u => u.Bio, dto.Bio);
+
+        if (!string.IsNullOrEmpty(dto.AvatarUrl))
+            updateDefinition = updateDefinition.Set(u => u.AvatarUrl, dto.AvatarUrl);
 
         if (dto.IsPrivate.HasValue)
             updateDefinition = updateDefinition.Set(u => u.IsPrivate, dto.IsPrivate.Value);
@@ -143,9 +409,52 @@ public class UsersController : ControllerBase
         return NoContent();
     }
 
+    [HttpPut("identity/{identityUserId}")]
+    public async Task<IActionResult> UpdateUserByIdentityId(string identityUserId, UpdateUserDto dto)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        var updateDefinition = Builders<Models.User>.Update
+            .Set(u => u.UpdatedAt, DateTime.UtcNow);
+
+        if (!string.IsNullOrEmpty(dto.UserName))
+            updateDefinition = updateDefinition.Set(u => u.UserName, dto.UserName);
+
+        if (!string.IsNullOrEmpty(dto.DisplayName))
+            updateDefinition = updateDefinition.Set(u => u.DisplayName, dto.DisplayName);
+
+        if (dto.Bio != null) // Allow setting empty bio
+            updateDefinition = updateDefinition.Set(u => u.Bio, dto.Bio);
+
+        if (!string.IsNullOrEmpty(dto.AvatarUrl))
+            updateDefinition = updateDefinition.Set(u => u.AvatarUrl, dto.AvatarUrl);
+
+        if (dto.IsPrivate.HasValue)
+            updateDefinition = updateDefinition.Set(u => u.IsPrivate, dto.IsPrivate.Value);
+
+        var result = await _context.Users.UpdateOneAsync(
+            u => u.IdentityUserId == identityUserId,
+            updateDefinition);
+
+        if (result.MatchedCount == 0)
+        {
+            return NotFound();
+        }
+
+        return NoContent();
+    }
+
     [HttpDelete("{id}")]
     public async Task<IActionResult> DeleteUser(string id)
     {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
         var result = await _context.Users.DeleteOneAsync(u => u.Id == id);
 
         if (result.DeletedCount == 0)
@@ -157,6 +466,8 @@ public class UsersController : ControllerBase
     }
 
 
+
+
 }
 
 public class UserDto
@@ -164,6 +475,9 @@ public class UserDto
     public string Id { get; set; } = string.Empty;
     public string IdentityUserId { get; set; } = string.Empty;
     public string UserName { get; set; } = string.Empty;
+    public string? DisplayName { get; set; }
+    public string? Bio { get; set; }
+    public string? AvatarUrl { get; set; }
     public List<PlaylistReferenceDto> Playlists { get; set; } = new();
     public List<UserReferenceDto> FollowedUsers { get; set; } = new();
     public List<UserReferenceDto> Followers { get; set; } = new();
@@ -185,11 +499,28 @@ public class CreateUserDto
 {
     public string IdentityUserId { get; set; } = string.Empty;
     public string UserName { get; set; } = string.Empty;
+    public string? DisplayName { get; set; }
+    public string? Bio { get; set; }
+    public string? AvatarUrl { get; set; }
     public bool IsPrivate { get; set; } = false;
 }
 
 public class UpdateUserDto
 {
     public string? UserName { get; set; }
+    public string? DisplayName { get; set; }
+    public string? Bio { get; set; }
+    public string? AvatarUrl { get; set; }
     public bool? IsPrivate { get; set; }
-} 
+}
+
+public class IdentityUserDto
+{
+    public string Id { get; set; } = string.Empty;
+    public string? UserName { get; set; }
+    public string? Email { get; set; }
+    public bool? IsPrivate { get; set; }
+    public DateTime? CreatedAt { get; set; }
+}
+
+ 

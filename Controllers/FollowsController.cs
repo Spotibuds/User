@@ -19,61 +19,87 @@ public class FollowsController : ControllerBase
     /// <summary>
     /// Follow a user
     /// </summary>
-    [HttpPost("{targetUserId}/follow")]
-    public async Task<IActionResult> FollowUser(Guid targetUserId, [FromBody] Guid currentUserId)
+    [HttpPost]
+    public async Task<IActionResult> FollowUser([FromBody] FollowRequestDto dto)
     {
-        // Check if already following
-        var follower = await _context.Users
-            .Find(u => u.IdentityUserId == currentUserId.ToString())
-            .FirstOrDefaultAsync();
-
-        var followed = await _context.Users
-            .Find(u => u.IdentityUserId == targetUserId.ToString())
-            .FirstOrDefaultAsync();
-
-        if (follower == null || followed == null)
+        if (!_context.IsConnected || _context.Users == null)
         {
-            return NotFound("One or both users not found");
+            Console.WriteLine("FollowUser: MongoDB not connected or Users collection is null");
+            return StatusCode(503, "Service unavailable - database connection failed");
         }
 
-        if (follower.FollowedUsers.Any(fu => fu.Id == followed.Id))
+        try
         {
-            return BadRequest("Already following this user");
-        }
+            // Prevent self-following
+            if (dto.FollowerId == dto.FollowedId)
+            {
+                return BadRequest("Cannot follow yourself");
+            }
 
-        // Prevent self-following
-        if (currentUserId == targetUserId)
+            // Check if users exist
+            var follower = await _context.Users
+                .Find(u => u.IdentityUserId == dto.FollowerId)
+                .FirstOrDefaultAsync();
+
+            var followed = await _context.Users
+                .Find(u => u.IdentityUserId == dto.FollowedId)
+                .FirstOrDefaultAsync();
+
+            if (follower == null || followed == null)
+            {
+                return NotFound("One or both users not found");
+            }
+
+            // Check if already following
+            if (follower.FollowedUsers.Any(fu => fu.Id == followed.Id))
+            {
+                return BadRequest("Already following this user");
+            }
+
+            // Add to follower's following list
+            await _context.Users.UpdateOneAsync(
+                u => u.Id == follower.Id,
+                Builders<Models.User>.Update
+                    .Push(u => u.FollowedUsers, new UserReference { Id = followed.Id })
+                    .Set(u => u.UpdatedAt, DateTime.UtcNow));
+
+            // Add to followed user's followers list
+            await _context.Users.UpdateOneAsync(
+                u => u.Id == followed.Id,
+                Builders<Models.User>.Update
+                    .Push(u => u.Followers, new UserReference { Id = follower.Id })
+                    .Set(u => u.UpdatedAt, DateTime.UtcNow));
+
+            return Ok(new { message = "Successfully followed user" });
+        }
+        catch (MongoDB.Driver.MongoConnectionException ex)
         {
-            return BadRequest("Cannot follow yourself");
+            return StatusCode(503, new { message = "Database temporarily unavailable", error = ex.Message });
         }
-
-        await _context.Users.UpdateOneAsync(
-            u => u.Id == follower.Id,
-            Builders<Models.User>.Update
-                .Push(u => u.FollowedUsers, new UserReference { Id = followed.Id })
-                .Set(u => u.UpdatedAt, DateTime.UtcNow));
-
-        await _context.Users.UpdateOneAsync(
-            u => u.Id == followed.Id,
-            Builders<Models.User>.Update
-                .Push(u => u.Followers, new UserReference { Id = follower.Id })
-                .Set(u => u.UpdatedAt, DateTime.UtcNow));
-
-        return Ok(new { message = "Successfully followed user" });
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
+        }
     }
 
     /// <summary>
     /// Unfollow a user
     /// </summary>
-    [HttpDelete("{targetUserId}/follow")]
-    public async Task<IActionResult> UnfollowUser(Guid targetUserId, [FromBody] Guid currentUserId)
+    [HttpDelete]
+    public async Task<IActionResult> UnfollowUser([FromBody] FollowRequestDto dto)
     {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            Console.WriteLine("UnfollowUser: MongoDB not connected or Users collection is null");
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
         var follower = await _context.Users
-            .Find(u => u.IdentityUserId == currentUserId.ToString())
+            .Find(u => u.IdentityUserId == dto.FollowerId)
             .FirstOrDefaultAsync();
 
         var followed = await _context.Users
-            .Find(u => u.IdentityUserId == targetUserId.ToString())
+            .Find(u => u.IdentityUserId == dto.FollowedId)
             .FirstOrDefaultAsync();
 
         if (follower == null || followed == null)
@@ -86,12 +112,14 @@ public class FollowsController : ControllerBase
             return NotFound("Not following this user");
         }
 
+        // Remove from follower's following list
         await _context.Users.UpdateOneAsync(
             u => u.Id == follower.Id,
             Builders<Models.User>.Update
                 .PullFilter(u => u.FollowedUsers, fu => fu.Id == followed.Id)
                 .Set(u => u.UpdatedAt, DateTime.UtcNow));
 
+        // Remove from followed user's followers list
         await _context.Users.UpdateOneAsync(
             u => u.Id == followed.Id,
             Builders<Models.User>.Update
@@ -102,79 +130,97 @@ public class FollowsController : ControllerBase
     }
 
     /// <summary>
-    /// Get followers of a user
+    /// Get followers for a user
     /// </summary>
     [HttpGet("{userId}/followers")]
-    public async Task<ActionResult<IEnumerable<Guid>>> GetFollowers(Guid userId)
+    public async Task<ActionResult<IEnumerable<string>>> GetFollowers(string userId)
     {
-        var user = await _context.Users
-            .Find(u => u.IdentityUserId == userId.ToString())
-            .FirstOrDefaultAsync();
-
-        if (user == null)
+        if (!_context.IsConnected || _context.Users == null)
         {
-            return NotFound();
+            Console.WriteLine("GetFollowers: MongoDB not connected or Users collection is null");
+            return StatusCode(503, "Service unavailable - database connection failed");
         }
 
-        var followerIds = new List<Guid>();
-        foreach (var follower in user.Followers)
+        try
         {
-            var followerUser = await _context.Users
-                .Find(u => u.Id == follower.Id)
+            var user = await _context.Users
+                .Find(u => u.IdentityUserId == userId)
                 .FirstOrDefaultAsync();
-            
-            if (followerUser != null && Guid.TryParse(followerUser.IdentityUserId, out var identityId))
-            {
-                followerIds.Add(identityId);
-            }
-        }
 
-        return Ok(followerIds);
+            if (user == null)
+            {
+                return NotFound("User not found");
+            }
+
+            var followerIds = user.Followers.Select(f => f.Id).ToList();
+
+            return Ok(followerIds);
+        }
+        catch (MongoDB.Driver.MongoConnectionException ex)
+        {
+            return StatusCode(503, new { message = "Database temporarily unavailable", error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
+        }
     }
 
     /// <summary>
     /// Get users that a user is following
     /// </summary>
     [HttpGet("{userId}/following")]
-    public async Task<ActionResult<IEnumerable<Guid>>> GetFollowing(Guid userId)
+    public async Task<ActionResult<IEnumerable<string>>> GetFollowing(string userId)
     {
-        var user = await _context.Users
-            .Find(u => u.IdentityUserId == userId.ToString())
-            .FirstOrDefaultAsync();
-
-        if (user == null)
+        if (!_context.IsConnected || _context.Users == null)
         {
-            return NotFound();
+            Console.WriteLine("GetFollowing: MongoDB not connected or Users collection is null");
+            return StatusCode(503, "Service unavailable - database connection failed");
         }
 
-        var followingIds = new List<Guid>();
-        foreach (var followed in user.FollowedUsers)
+        try
         {
-            var followedUser = await _context.Users
-                .Find(u => u.Id == followed.Id)
+            var user = await _context.Users
+                .Find(u => u.IdentityUserId == userId)
                 .FirstOrDefaultAsync();
-            
-            if (followedUser != null && Guid.TryParse(followedUser.IdentityUserId, out var identityId))
-            {
-                followingIds.Add(identityId);
-            }
-        }
 
-        return Ok(followingIds);
+            if (user == null)
+            {
+                return NotFound("User not found");
+            }
+
+            var followingIds = user.FollowedUsers.Select(f => f.Id).ToList();
+
+            return Ok(followingIds);
+        }
+        catch (MongoDB.Driver.MongoConnectionException ex)
+        {
+            return StatusCode(503, new { message = "Database temporarily unavailable", error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
+        }
     }
 
     /// <summary>
     /// Check if user A follows user B
     /// </summary>
-    [HttpGet("{followerId}/follows/{followedId}")]
-    public async Task<ActionResult<bool>> CheckIfFollowing(Guid followerId, Guid followedId)
+    [HttpGet("check")]
+    public async Task<ActionResult<bool>> CheckIfFollowing([FromQuery] string followerId, [FromQuery] string followedId)
     {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            Console.WriteLine("CheckIfFollowing: MongoDB not connected or Users collection is null");
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
         var follower = await _context.Users
-            .Find(u => u.IdentityUserId == followerId.ToString())
+            .Find(u => u.IdentityUserId == followerId)
             .FirstOrDefaultAsync();
 
         var followed = await _context.Users
-            .Find(u => u.IdentityUserId == followedId.ToString())
+            .Find(u => u.IdentityUserId == followedId)
             .FirstOrDefaultAsync();
 
         if (follower == null || followed == null)
@@ -191,10 +237,16 @@ public class FollowsController : ControllerBase
     /// Get follow statistics for a user
     /// </summary>
     [HttpGet("{userId}/stats")]
-    public async Task<ActionResult> GetFollowStats(Guid userId)
+    public async Task<ActionResult> GetFollowStats(string userId)
     {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            Console.WriteLine("GetFollowStats: MongoDB not connected or Users collection is null");
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
         var user = await _context.Users
-            .Find(u => u.IdentityUserId == userId.ToString())
+            .Find(u => u.IdentityUserId == userId)
             .FirstOrDefaultAsync();
 
         if (user == null)
@@ -209,4 +261,10 @@ public class FollowsController : ControllerBase
             followingCount = user.FollowedUsers.Count
         });
     }
+}
+
+public class FollowRequestDto
+{
+    public string FollowerId { get; set; } = string.Empty;
+    public string FollowedId { get; set; } = string.Empty;
 } 
