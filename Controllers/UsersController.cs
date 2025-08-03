@@ -233,9 +233,18 @@ public class UsersController : ControllerBase
 
         try
         {
+            // Try to find user by IdentityUserId first, then by MongoDB _id
             var user = await _context.Users
                 .Find(u => u.IdentityUserId == id)
                 .FirstOrDefaultAsync();
+            
+            if (user == null)
+            {
+                // If not found by IdentityUserId, try by MongoDB _id
+                user = await _context.Users
+                    .Find(u => u.Id == id)
+                    .FirstOrDefaultAsync();
+            }
             
             if (user == null)
             {

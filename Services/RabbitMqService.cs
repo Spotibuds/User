@@ -13,48 +13,93 @@ public interface IRabbitMqService
 
 public class RabbitMqService : IRabbitMqService, IDisposable
 {
-    private readonly IConnection _connection;
-    private readonly IModel _channel;
+    private readonly IConnection? _connection;
+    private readonly IModel? _channel;
+    private readonly bool _isConnected;
 
     public RabbitMqService(IConfiguration configuration)
     {
-        var factory = new ConnectionFactory()
+        try
         {
-            HostName = configuration.GetConnectionString("RabbitMQ:Host") ?? "localhost",
-            Port = int.Parse(configuration.GetConnectionString("RabbitMQ:Port") ?? "5672"),
-            UserName = configuration.GetConnectionString("RabbitMQ:Username") ?? "guest",
-            Password = configuration.GetConnectionString("RabbitMQ:Password") ?? "guest"
-        };
+            var factory = new ConnectionFactory()
+            {
+                HostName = configuration["RabbitMQ:HostName"] ?? configuration["RabbitMQ:Host"] ?? "localhost",
+                Port = int.Parse(configuration["RabbitMQ:Port"] ?? "5672"),
+                UserName = configuration["RabbitMQ:UserName"] ?? configuration["RabbitMQ:Username"] ?? "guest",
+                Password = configuration["RabbitMQ:Password"] ?? "guest",
+                VirtualHost = configuration["RabbitMQ:VirtualHost"] ?? "/"
+            };
 
-        _connection = factory.CreateConnection();
-        _channel = _connection.CreateModel();
+            _connection = factory.CreateConnection();
+            _channel = _connection.CreateModel();
+            _isConnected = true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"RabbitMQ connection failed: {ex.Message}");
+            _connection = null;
+            _channel = null;
+            _isConnected = false;
+        }
     }
 
     public async Task PublishMessageAsync<T>(string routingKey, T message)
     {
-        var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
+        if (!_isConnected || _channel == null)
+        {
+            Console.WriteLine("RabbitMQ not connected, skipping message publish");
+            await Task.CompletedTask;
+            return;
+        }
 
-        _channel.BasicPublish(exchange: "", routingKey: routingKey, basicProperties: null, body: body);
-
-        await Task.CompletedTask;
+        try
+        {
+            var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
+            _channel.BasicPublish(exchange: "", routingKey: routingKey, basicProperties: null, body: body);
+            await Task.CompletedTask;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to publish message to RabbitMQ: {ex.Message}");
+            await Task.CompletedTask;
+        }
     }
 
     public void StartConsumingAsync(string queueName, Func<string, Task> messageHandler)
     {
-        _channel.QueueDeclare(queue: queueName, durable: true, exclusive: false, autoDelete: false, arguments: null);
-
-        var consumer = new EventingBasicConsumer(_channel);
-        consumer.Received += async (model, ea) =>
+        if (!_isConnected || _channel == null)
         {
-            var body = ea.Body.ToArray();
-            var message = Encoding.UTF8.GetString(body);
+            Console.WriteLine("RabbitMQ not connected, skipping consumer setup");
+            return;
+        }
 
-            await messageHandler(message);
+        try
+        {
+            _channel.QueueDeclare(queue: queueName, durable: true, exclusive: false, autoDelete: false, arguments: null);
 
-            _channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
-        };
+            var consumer = new EventingBasicConsumer(_channel);
+            consumer.Received += async (model, ea) =>
+            {
+                try
+                {
+                    var body = ea.Body.ToArray();
+                    var message = Encoding.UTF8.GetString(body);
+                    await messageHandler(message);
+                    _channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error processing RabbitMQ message: {ex.Message}");
+                    _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: true);
+                }
+            };
 
-        _channel.BasicConsume(queue: queueName, autoAck: false, consumer: consumer);
+            _channel.BasicConsume(queue: queueName, autoAck: false, consumer: consumer);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to setup RabbitMQ consumer: {ex.Message}");
+        }
     }
 
     public void Dispose()

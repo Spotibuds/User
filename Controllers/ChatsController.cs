@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using MongoDB.Driver;
 using User.Data;
 using User.Services;
+using System.Security.Claims;
 
 namespace User.Controllers;
 
@@ -10,12 +11,26 @@ namespace User.Controllers;
 public class ChatsController : ControllerBase
 {
     private readonly MongoDbContext _context;
-    private readonly IRabbitMqService _rabbitMq;
+    private readonly IRabbitMqService? _rabbitMq;
 
-    public ChatsController(MongoDbContext context, IRabbitMqService rabbitMq)
+    public ChatsController(MongoDbContext context, IRabbitMqService? rabbitMq)
     {
         _context = context;
         _rabbitMq = rabbitMq;
+    }
+
+    private string? GetUserIdFromClaims()
+    {
+        var user = User;
+        if (user?.Identity?.IsAuthenticated == true)
+        {
+            var userIdClaim = user.FindFirst("sub") ?? 
+                             user.FindFirst("userId") ?? 
+                             user.FindFirst("nameid") ?? 
+                             user.FindFirst("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier");
+            return userIdClaim?.Value;
+        }
+        return null;
     }
 
     /// <summary>
@@ -32,29 +47,64 @@ public class ChatsController : ControllerBase
 
         try
         {
-            var currentUserId = User.Identity?.Name;
+            var currentUserId = GetUserIdFromClaims();
             if (string.IsNullOrEmpty(currentUserId))
             {
-                return Unauthorized();
+                return Unauthorized("User not authenticated");
+            }
+
+            // Convert IdentityUserId to MongoDB _id for participants
+            var participantMongoIds = new List<string>();
+            foreach (var participantId in dto.ParticipantIds)
+            {
+                var user = await _context.Users
+                    .Find(u => u.IdentityUserId == participantId)
+                    .FirstOrDefaultAsync();
+                
+                if (user == null)
+                {
+                    return BadRequest($"User with IdentityUserId {participantId} not found");
+                }
+                
+                participantMongoIds.Add(user.Id);
             }
 
             // For one-on-one chats, check if chat already exists
-            if (!dto.IsGroup && dto.ParticipantIds.Count == 2)
+            if (!dto.IsGroup && participantMongoIds.Count == 2)
             {
                 var existingChat = await _context.Chats
                     .Find(c => !c.IsGroup && 
-                              c.Participants.Contains(dto.ParticipantIds[0]) && 
-                              c.Participants.Contains(dto.ParticipantIds[1]))
+                              c.Participants.Contains(participantMongoIds[0]) && 
+                              c.Participants.Contains(participantMongoIds[1]))
                     .FirstOrDefaultAsync();
 
                 if (existingChat != null)
                 {
+                    // Convert MongoDB _id back to IdentityUserId for participants
+                    var existingParticipantIdentityIds = new List<string>();
+                    foreach (var participantId in existingChat.Participants)
+                    {
+                        var participant = await _context.Users
+                            .Find(u => u.Id == participantId)
+                            .FirstOrDefaultAsync();
+                        
+                        if (participant != null)
+                        {
+                            existingParticipantIdentityIds.Add(participant.IdentityUserId);
+                        }
+                        else
+                        {
+                            // Fallback to original ID if user not found
+                            existingParticipantIdentityIds.Add(participantId);
+                        }
+                    }
+
                     return Ok(new
                     {
                         chatId = existingChat.Id,
                         isGroup = existingChat.IsGroup,
                         name = existingChat.Name,
-                        participants = existingChat.Participants,
+                        participants = existingParticipantIdentityIds,
                         lastActivity = existingChat.LastActivity,
                         existed = true
                     });
@@ -64,7 +114,7 @@ public class ChatsController : ControllerBase
             // Create new chat
             var chat = new Entities.Chat
             {
-                Participants = dto.ParticipantIds,
+                Participants = participantMongoIds,
                 IsGroup = dto.IsGroup,
                 Name = dto.Name,
                 CreatedAt = DateTime.UtcNow,
@@ -73,12 +123,31 @@ public class ChatsController : ControllerBase
 
             await _context.Chats.InsertOneAsync(chat);
 
+            // Convert MongoDB _id back to IdentityUserId for participants in response
+            var newParticipantIdentityIds = new List<string>();
+            foreach (var participantId in chat.Participants)
+            {
+                var participant = await _context.Users
+                    .Find(u => u.Id == participantId)
+                    .FirstOrDefaultAsync();
+                
+                if (participant != null)
+                {
+                    newParticipantIdentityIds.Add(participant.IdentityUserId);
+                }
+                else
+                {
+                    // Fallback to original ID if user not found
+                    newParticipantIdentityIds.Add(participantId);
+                }
+            }
+
             return Ok(new
             {
                 chatId = chat.Id,
                 isGroup = chat.IsGroup,
                 name = chat.Name,
-                participants = chat.Participants,
+                participants = newParticipantIdentityIds,
                 lastActivity = chat.LastActivity,
                 existed = false
             });
@@ -99,10 +168,20 @@ public class ChatsController : ControllerBase
     [HttpGet("{id}")]
     public async Task<ActionResult<object>> GetChat(string id)
     {
-        var currentUserId = User.Identity?.Name;
+        var currentUserId = GetUserIdFromClaims();
         if (string.IsNullOrEmpty(currentUserId))
         {
-            return Unauthorized();
+            return Unauthorized("User not authenticated");
+        }
+
+        // Convert IdentityUserId to MongoDB _id for current user
+        var currentUser = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (currentUser == null)
+        {
+            return Unauthorized("User not found in database");
         }
 
         // Check if requesting user has access to this chat
@@ -112,12 +191,31 @@ public class ChatsController : ControllerBase
 
         if (chat == null)
         {
-            return NotFound();
+            return NotFound("Chat not found");
         }
 
-        if (!chat.Participants.Contains(currentUserId))
+        if (!chat.Participants.Contains(currentUser.Id))
         {
-            return Forbid();
+            return Forbid("Access denied to this chat");
+        }
+
+        // Convert MongoDB _id back to IdentityUserId for participants
+        var participantIdentityIds = new List<string>();
+        foreach (var participantId in chat.Participants)
+        {
+            var participant = await _context.Users
+                .Find(u => u.Id == participantId)
+                .FirstOrDefaultAsync();
+            
+            if (participant != null)
+            {
+                participantIdentityIds.Add(participant.IdentityUserId);
+            }
+            else
+            {
+                // Fallback to original ID if user not found
+                participantIdentityIds.Add(participantId);
+            }
         }
 
         return Ok(new
@@ -125,7 +223,7 @@ public class ChatsController : ControllerBase
             chatId = chat.Id,
             isGroup = chat.IsGroup,
             name = chat.Name,
-            participants = chat.Participants,
+            participants = participantIdentityIds,
             lastActivity = chat.LastActivity,
             lastMessageId = chat.LastMessageId
         });
@@ -145,20 +243,53 @@ public class ChatsController : ControllerBase
 
         try
         {
+            // Convert IdentityUserId to MongoDB _id
+            var user = await _context.Users
+                .Find(u => u.IdentityUserId == userId)
+                .FirstOrDefaultAsync();
+                
+            if (user == null)
+            {
+                return NotFound("User not found");
+            }
+
             var chats = await _context.Chats
-                .Find(c => c.Participants.Contains(userId))
+                .Find(c => c.Participants.Contains(user.Id))
                 .SortByDescending(c => c.LastActivity)
                 .ToListAsync();
 
-            var chatList = chats.Select(chat => new
+            var chatList = new List<object>();
+            foreach (var chat in chats)
             {
-                chatId = chat.Id,
-                isGroup = chat.IsGroup,
-                name = chat.Name,
-                participants = chat.Participants,
-                lastActivity = chat.LastActivity,
-                createdAt = chat.CreatedAt
-            }).ToList();
+                // Convert MongoDB _id back to IdentityUserId for participants
+                var participantIdentityIds = new List<string>();
+                foreach (var participantId in chat.Participants)
+                {
+                    var participant = await _context.Users
+                        .Find(u => u.Id == participantId)
+                        .FirstOrDefaultAsync();
+                    
+                    if (participant != null)
+                    {
+                        participantIdentityIds.Add(participant.IdentityUserId);
+                    }
+                    else
+                    {
+                        // Fallback to original ID if user not found
+                        participantIdentityIds.Add(participantId);
+                    }
+                }
+
+                chatList.Add(new
+                {
+                    chatId = chat.Id,
+                    isGroup = chat.IsGroup,
+                    name = chat.Name,
+                    participants = participantIdentityIds,
+                    lastActivity = chat.LastActivity,
+                    createdAt = chat.CreatedAt
+                });
+            }
 
             return Ok(chatList);
         }
@@ -184,10 +315,20 @@ public class ChatsController : ControllerBase
             return StatusCode(503, "Service unavailable - database connection failed");
         }
 
-        var currentUserId = User.Identity?.Name;
+        var currentUserId = GetUserIdFromClaims();
         if (string.IsNullOrEmpty(currentUserId))
         {
-            return Unauthorized();
+            return Unauthorized("User not authenticated");
+        }
+
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            return Unauthorized("User not found in database");
         }
 
         // Check if requesting user has access to this chat
@@ -197,12 +338,12 @@ public class ChatsController : ControllerBase
 
         if (chat == null)
         {
-            return NotFound();
+            return NotFound("Chat not found");
         }
 
-        if (!chat.Participants.Contains(currentUserId))
+        if (!chat.Participants.Contains(user.Id))
         {
-            return Forbid();
+            return Forbid("Access denied to this chat");
         }
 
         var messages = await _context.Messages
@@ -212,19 +353,28 @@ public class ChatsController : ControllerBase
             .Limit(pageSize)
             .ToListAsync();
 
-        var result = messages.Select(m => new
+        var result = new List<object>();
+        foreach (var m in messages)
         {
-            messageId = m.Id,
-            chatId = m.ChatId,
-            senderId = m.SenderId,
-            content = m.Content,
-            type = m.Type.ToString(),
-            sentAt = m.SentAt,
-            isEdited = m.IsEdited,
-            editedAt = m.EditedAt,
-            readBy = m.ReadBy,
-            replyToId = m.ReplyToId
-        });
+            // Convert sender MongoDB _id back to IdentityUserId
+            var sender = await _context.Users
+                .Find(u => u.Id == m.SenderId)
+                .FirstOrDefaultAsync();
+
+            result.Add(new
+            {
+                messageId = m.Id,
+                chatId = m.ChatId,
+                senderId = sender?.IdentityUserId ?? m.SenderId,
+                content = m.Content,
+                type = m.Type.ToString(),
+                sentAt = m.SentAt,
+                isEdited = m.IsEdited,
+                editedAt = m.EditedAt,
+                readBy = m.ReadBy,
+                replyToId = m.ReplyToId
+            });
+        }
 
         return Ok(result);
     }
@@ -235,10 +385,20 @@ public class ChatsController : ControllerBase
     [HttpPost("{chatId}/messages")]
     public async Task<ActionResult<object>> SendMessage(string chatId, [FromBody] SendMessageDto dto)
     {
-        var currentUserId = User.Identity?.Name;
+        var currentUserId = GetUserIdFromClaims();
         if (string.IsNullOrEmpty(currentUserId))
         {
-            return Unauthorized();
+            return Unauthorized("User not authenticated");
+        }
+
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            return Unauthorized("User not found in database");
         }
 
         // Check if requesting user has access to this chat
@@ -248,24 +408,24 @@ public class ChatsController : ControllerBase
 
         if (chat == null)
         {
-            return NotFound();
+            return NotFound("Chat not found");
         }
 
-        if (!chat.Participants.Contains(currentUserId))
+        if (!chat.Participants.Contains(user.Id))
         {
-            return Forbid();
+            return Forbid("Access denied to this chat");
         }
 
         var message = new Entities.Message
         {
             ChatId = chatId,
-            SenderId = currentUserId,
+            SenderId = user.Id, // Use MongoDB _id
             Content = dto.Content,
             Type = Enum.Parse<Entities.MessageType>(dto.Type, true),
             SentAt = DateTime.UtcNow,
             ReadBy = new List<Entities.MessageRead>
             {
-                new Entities.MessageRead { UserId = currentUserId, ReadAt = DateTime.UtcNow }
+                new Entities.MessageRead { UserId = user.Id, ReadAt = DateTime.UtcNow } // Use MongoDB _id
             },
             ReplyToId = dto.ReplyToId
         };
@@ -284,19 +444,27 @@ public class ChatsController : ControllerBase
         {
             ChatId = chatId,
             MessageId = message.Id,
-            SenderId = currentUserId,
+            SenderId = user.Id, // Use MongoDB _id
             Content = dto.Content,
             SentAt = message.SentAt,
-            Recipients = chat.Participants.Where(p => p != currentUserId).ToList()
+            Recipients = chat.Participants.Where(p => p != user.Id).ToList() // Use MongoDB _id
         };
 
-        await _rabbitMq.PublishMessageAsync("chat.message", notification);
+        if (_rabbitMq != null)
+        {
+            await _rabbitMq.PublishMessageAsync("chat.message", notification);
+        }
+
+        // Convert sender MongoDB _id back to IdentityUserId
+        var sender = await _context.Users
+            .Find(u => u.Id == message.SenderId)
+            .FirstOrDefaultAsync();
 
         return Ok(new
         {
             messageId = message.Id,
             chatId = message.ChatId,
-            senderId = message.SenderId,
+            senderId = sender?.IdentityUserId ?? message.SenderId,
             content = message.Content,
             type = message.Type.ToString(),
             sentAt = message.SentAt
@@ -309,10 +477,10 @@ public class ChatsController : ControllerBase
     [HttpGet("messages/{messageId}")]
     public async Task<ActionResult<object>> GetMessage(string messageId)
     {
-        var currentUserId = User.Identity?.Name;
+        var currentUserId = GetUserIdFromClaims();
         if (string.IsNullOrEmpty(currentUserId))
         {
-            return Unauthorized();
+            return Unauthorized("User not authenticated");
         }
 
         var message = await _context.Messages
@@ -324,9 +492,19 @@ public class ChatsController : ControllerBase
             return NotFound();
         }
 
+        // Convert IdentityUserId to MongoDB _id for current user
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            return Unauthorized("User not found in database");
+        }
+
         // Check if user has access to this message (through chat participation)
         var chat = await _context.Chats
-            .Find(c => c.Id == message.ChatId && c.Participants.Contains(currentUserId))
+            .Find(c => c.Id == message.ChatId && c.Participants.Contains(user.Id))
             .FirstOrDefaultAsync();
 
         if (chat == null)
@@ -334,11 +512,16 @@ public class ChatsController : ControllerBase
             return Forbid();
         }
 
+        // Convert sender MongoDB _id back to IdentityUserId
+        var sender = await _context.Users
+            .Find(u => u.Id == message.SenderId)
+            .FirstOrDefaultAsync();
+
         return Ok(new
         {
             messageId = message.Id,
             chatId = message.ChatId,
-            senderId = message.SenderId,
+            senderId = sender?.IdentityUserId ?? message.SenderId,
             content = message.Content,
             type = message.Type.ToString(),
             sentAt = message.SentAt,
@@ -355,10 +538,20 @@ public class ChatsController : ControllerBase
     [HttpPost("messages/{messageId}/read")]
     public async Task<IActionResult> MarkMessageAsRead(string messageId)
     {
-        var currentUserId = User.Identity?.Name;
+        var currentUserId = GetUserIdFromClaims();
         if (string.IsNullOrEmpty(currentUserId))
         {
-            return Unauthorized();
+            return Unauthorized("User not authenticated");
+        }
+
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            return Unauthorized("User not found in database");
         }
 
         var message = await _context.Messages
@@ -367,21 +560,21 @@ public class ChatsController : ControllerBase
 
         if (message == null)
         {
-            return NotFound();
+            return NotFound("Message not found");
         }
 
         // Check if user has access to this message
         var chat = await _context.Chats
-            .Find(c => c.Id == message.ChatId && c.Participants.Contains(currentUserId))
+            .Find(c => c.Id == message.ChatId && c.Participants.Contains(user.Id))
             .FirstOrDefaultAsync();
 
         if (chat == null)
         {
-            return Forbid();
+            return Forbid("Access denied to this message");
         }
 
         // Check if already marked as read
-        if (message.ReadBy.Any(r => r.UserId == currentUserId))
+        if (message.ReadBy.Any(r => r.UserId == user.Id))
         {
             return Ok(new { message = "Already marked as read" });
         }
@@ -391,7 +584,7 @@ public class ChatsController : ControllerBase
             m => m.Id == messageId,
             Builders<Entities.Message>.Update.Push(m => m.ReadBy, new Entities.MessageRead
             {
-                UserId = currentUserId,
+                UserId = user.Id, // Use MongoDB _id
                 ReadAt = DateTime.UtcNow
             }));
 
@@ -404,19 +597,29 @@ public class ChatsController : ControllerBase
     [HttpDelete("{chatId}")]
     public async Task<IActionResult> DeleteChat(string chatId)
     {
-        var currentUserId = User.Identity?.Name;
+        var currentUserId = GetUserIdFromClaims();
         if (string.IsNullOrEmpty(currentUserId))
         {
-            return Unauthorized();
+            return Unauthorized("User not authenticated");
+        }
+
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            return Unauthorized("User not found in database");
         }
 
         var chat = await _context.Chats
-            .Find(c => c.Id == chatId && c.Participants.Contains(currentUserId))
+            .Find(c => c.Id == chatId && c.Participants.Contains(user.Id))
             .FirstOrDefaultAsync();
 
         if (chat == null)
         {
-            return NotFound();
+            return NotFound("Chat not found or access denied");
         }
 
         // Delete all messages in the chat

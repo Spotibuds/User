@@ -4,9 +4,11 @@ using User.Data;
 using User.Entities;
 using User.Models;
 using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
 
 namespace User.Hubs;
 
+[Authorize]
 public class FriendHub : Hub
 {
     private readonly MongoDbContext _context;
@@ -23,6 +25,17 @@ public class FriendHub : Hub
     {
         try
         {
+            _logger.LogInformation($"SignalR connection attempt from: {Context.ConnectionId}");
+            
+            // Debug: Log all query parameters
+            var httpContext = Context.GetHttpContext();
+            var queryParams = httpContext?.Request.Query;
+            _logger.LogInformation($"Query parameters: {string.Join(", ", queryParams?.Select(q => $"{q.Key}={q.Value}") ?? Array.Empty<string>())}");
+            
+            // Debug: Log authorization header
+            var authHeader = httpContext?.Request.Headers["Authorization"].FirstOrDefault();
+            _logger.LogInformation($"Authorization header present: {!string.IsNullOrEmpty(authHeader)}");
+            
             var userId = GetUserIdFromContext();
             if (string.IsNullOrEmpty(userId))
             {
@@ -43,13 +56,13 @@ public class FriendHub : Hub
             // Notify friends that user is online
             await NotifyFriendsOnlineStatus(userId, true);
             
-            _logger.LogInformation($"User {userId} connected: {Context.ConnectionId}");
+            _logger.LogInformation($"User {userId} connected successfully: {Context.ConnectionId}");
             
             await base.OnConnectedAsync();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error in OnConnectedAsync");
+            _logger.LogError(ex, "Error in OnConnectedAsync for connection {ConnectionId}", Context.ConnectionId);
             throw;
         }
     }
@@ -94,10 +107,23 @@ public class FriendHub : Hub
                 return;
             }
 
+            // Convert IdentityUserIds to MongoDB _ids for database queries
+            var sender = await _context.Users.Find(u => u.IdentityUserId == senderId).FirstOrDefaultAsync();
+            var target = await _context.Users.Find(u => u.IdentityUserId == targetUserId).FirstOrDefaultAsync();
+            
+            if (sender == null || target == null)
+            {
+                await Clients.Caller.SendAsync("Error", "User not found");
+                return;
+            }
+
+            var senderMongoId = sender.Id;
+            var targetMongoId = target.Id;
+
             // Check if request already exists
             var existingRequest = await _context.Friends
-                .Find(f => (f.UserId == senderId && f.FriendId == targetUserId) ||
-                           (f.UserId == targetUserId && f.FriendId == senderId))
+                .Find(f => (f.UserId == senderMongoId && f.FriendId == targetMongoId) ||
+                           (f.UserId == targetMongoId && f.FriendId == senderMongoId))
                 .FirstOrDefaultAsync();
 
             if (existingRequest != null)
@@ -109,31 +135,28 @@ public class FriendHub : Hub
             // Create friend request
             var friendRequest = new Friend
             {
-                UserId = senderId,
-                FriendId = targetUserId,
+                UserId = senderMongoId,
+                FriendId = targetMongoId,
                 Status = FriendStatus.Pending,
                 CreatedAt = DateTime.UtcNow
             };
 
             await _context.Friends.InsertOneAsync(friendRequest);
-
-            // Get sender info for notification
-            var sender = await _context.Users.Find(u => u.Id == senderId).FirstOrDefaultAsync();
             
             // Notify target user
             await Clients.Group($"user_{targetUserId}").SendAsync("FriendRequestReceived", new
             {
                 RequestId = friendRequest.Id,
-                SenderId = senderId,
-                SenderName = sender?.UserName ?? "Unknown User",
-                SenderAvatar = sender?.AvatarUrl,
+                SenderId = senderId, // Use IdentityUserId for frontend
+                SenderName = sender.UserName ?? "Unknown User",
+                SenderAvatar = sender.AvatarUrl,
                 Timestamp = friendRequest.CreatedAt
             });
 
             await Clients.Caller.SendAsync("FriendRequestSent", new
             {
                 RequestId = friendRequest.Id,
-                TargetUserId = targetUserId,
+                TargetUserId = targetUserId, // Use IdentityUserId for frontend
                 Timestamp = friendRequest.CreatedAt
             });
 
@@ -157,7 +180,17 @@ public class FriendHub : Hub
                 return;
             }
 
-            var friendRequest = await _context.Friends.Find(f => f.Id == requestId && f.FriendId == userId).FirstOrDefaultAsync();
+            // Convert IdentityUserId to MongoDB _id for database queries
+            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                await Clients.Caller.SendAsync("Error", "User not found");
+                return;
+            }
+
+            var userMongoId = user.Id;
+
+            var friendRequest = await _context.Friends.Find(f => f.Id == requestId && f.FriendId == userMongoId).FirstOrDefaultAsync();
             if (friendRequest == null)
             {
                 await Clients.Caller.SendAsync("Error", "Friend request not found");
@@ -168,24 +201,27 @@ public class FriendHub : Hub
             var update = Builders<Friend>.Update.Set(f => f.Status, FriendStatus.Accepted);
             await _context.Friends.UpdateOneAsync(f => f.Id == requestId, update);
 
-            // Get user info for notifications
-            var user = await _context.Users.Find(u => u.Id == userId).FirstOrDefaultAsync();
+            // Get friend info for notifications
             var friend = await _context.Users.Find(u => u.Id == friendRequest.UserId).FirstOrDefaultAsync();
+            var friendIdentityId = friend?.IdentityUserId;
 
             // Notify both users
-            await Clients.Group($"user_{friendRequest.UserId}").SendAsync("FriendRequestAccepted", new
+            if (!string.IsNullOrEmpty(friendIdentityId))
             {
-                RequestId = requestId,
-                AcceptedBy = userId,
-                AcceptedByName = user?.UserName ?? "Unknown User",
-                AcceptedByAvatar = user?.AvatarUrl,
-                Timestamp = DateTime.UtcNow
-            });
+                await Clients.Group($"user_{friendIdentityId}").SendAsync("FriendRequestAccepted", new
+                {
+                    RequestId = requestId,
+                    AcceptedBy = userId, // Use IdentityUserId for frontend
+                    AcceptedByName = user.UserName ?? "Unknown User",
+                    AcceptedByAvatar = user.AvatarUrl,
+                    Timestamp = DateTime.UtcNow
+                });
+            }
 
             await Clients.Caller.SendAsync("FriendRequestAccepted", new
             {
                 RequestId = requestId,
-                FriendId = friendRequest.UserId,
+                FriendId = friendIdentityId ?? friendRequest.UserId, // Use IdentityUserId for frontend
                 FriendName = friend?.UserName ?? "Unknown User",
                 FriendAvatar = friend?.AvatarUrl,
                 Timestamp = DateTime.UtcNow
@@ -211,7 +247,17 @@ public class FriendHub : Hub
                 return;
             }
 
-            var friendRequest = await _context.Friends.Find(f => f.Id == requestId && f.FriendId == userId).FirstOrDefaultAsync();
+            // Convert IdentityUserId to MongoDB _id for database queries
+            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                await Clients.Caller.SendAsync("Error", "User not found");
+                return;
+            }
+
+            var userMongoId = user.Id;
+
+            var friendRequest = await _context.Friends.Find(f => f.Id == requestId && f.FriendId == userMongoId).FirstOrDefaultAsync();
             if (friendRequest == null)
             {
                 await Clients.Caller.SendAsync("Error", "Friend request not found");
@@ -221,13 +267,20 @@ public class FriendHub : Hub
             // Delete the friend request
             await _context.Friends.DeleteOneAsync(f => f.Id == requestId);
 
+            // Get friend IdentityUserId for notification
+            var friend = await _context.Users.Find(u => u.Id == friendRequest.UserId).FirstOrDefaultAsync();
+            var friendIdentityId = friend?.IdentityUserId;
+
             // Notify sender
-            await Clients.Group($"user_{friendRequest.UserId}").SendAsync("FriendRequestDeclined", new
+            if (!string.IsNullOrEmpty(friendIdentityId))
             {
-                RequestId = requestId,
-                DeclinedBy = userId,
-                Timestamp = DateTime.UtcNow
-            });
+                await Clients.Group($"user_{friendIdentityId}").SendAsync("FriendRequestDeclined", new
+                {
+                    RequestId = requestId,
+                    DeclinedBy = userId, // Use IdentityUserId for frontend
+                    Timestamp = DateTime.UtcNow
+                });
+            }
 
             await Clients.Caller.SendAsync("FriendRequestDeclined", new
             {
@@ -255,10 +308,23 @@ public class FriendHub : Hub
                 return;
             }
 
+            // Convert IdentityUserIds to MongoDB _ids for database queries
+            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
+            var friend = await _context.Users.Find(u => u.IdentityUserId == friendId).FirstOrDefaultAsync();
+            
+            if (user == null || friend == null)
+            {
+                await Clients.Caller.SendAsync("Error", "User not found");
+                return;
+            }
+
+            var userMongoId = user.Id;
+            var friendMongoId = friend.Id;
+
             // Find and remove friend relationship
             var friendRelationship = await _context.Friends
-                .Find(f => (f.UserId == userId && f.FriendId == friendId) ||
-                           (f.UserId == friendId && f.FriendId == userId))
+                .Find(f => (f.UserId == userMongoId && f.FriendId == friendMongoId) ||
+                           (f.UserId == friendMongoId && f.FriendId == userMongoId))
                 .FirstOrDefaultAsync();
 
             if (friendRelationship == null)
@@ -272,13 +338,13 @@ public class FriendHub : Hub
             // Notify both users
             await Clients.Group($"user_{friendId}").SendAsync("FriendRemoved", new
             {
-                RemovedBy = userId,
+                RemovedBy = userId, // Use IdentityUserId for frontend
                 Timestamp = DateTime.UtcNow
             });
 
             await Clients.Caller.SendAsync("FriendRemoved", new
             {
-                RemovedFriendId = friendId,
+                RemovedFriendId = friendId, // Use IdentityUserId for frontend
                 Timestamp = DateTime.UtcNow
             });
 
@@ -303,9 +369,19 @@ public class FriendHub : Hub
                 return;
             }
 
+            // Convert IdentityUserId to MongoDB _id for database queries
+            var sender = await _context.Users.Find(u => u.IdentityUserId == senderId).FirstOrDefaultAsync();
+            if (sender == null)
+            {
+                await Clients.Caller.SendAsync("Error", "User not found");
+                return;
+            }
+
+            var senderMongoId = sender.Id;
+
             // Validate chat access
             var chat = await _context.Chats.Find(c => c.Id == chatId).FirstOrDefaultAsync();
-            if (chat == null || (!chat.Participants.Contains(senderId)))
+            if (chat == null || (!chat.Participants.Contains(senderMongoId)))
             {
                 await Clients.Caller.SendAsync("Error", "Chat not found or access denied");
                 return;
@@ -315,28 +391,32 @@ public class FriendHub : Hub
             var newMessage = new Message
             {
                 ChatId = chatId,
-                SenderId = senderId,
+                SenderId = senderMongoId, // Store MongoDB _id
                 Content = message,
                 SentAt = DateTime.UtcNow
             };
 
             await _context.Messages.InsertOneAsync(newMessage);
 
-            // Get sender info
-            var sender = await _context.Users.Find(u => u.Id == senderId).FirstOrDefaultAsync();
+            // Get participant IdentityUserIds for notifications
+            var participants = await _context.Users
+                .Find(u => chat.Participants.Contains(u.Id))
+                .ToListAsync();
+
+            var participantIdentityIds = participants.Select(u => u.IdentityUserId).ToList();
 
             // Notify all chat participants
-            foreach (var participantId in chat.Participants)
+            foreach (var participantIdentityId in participantIdentityIds)
             {
-                if (participantId != senderId) // Don't send to sender
+                if (participantIdentityId != senderId) // Don't send to sender
                 {
-                    await Clients.Group($"user_{participantId}").SendAsync("MessageReceived", new
+                    await Clients.Group($"user_{participantIdentityId}").SendAsync("MessageReceived", new
                     {
                         ChatId = chatId,
                         MessageId = newMessage.Id,
-                        SenderId = senderId,
-                        SenderName = sender?.UserName ?? "Unknown User",
-                        SenderAvatar = sender?.AvatarUrl,
+                        SenderId = senderId, // Use IdentityUserId for frontend
+                        SenderName = sender.UserName ?? "Unknown User",
+                        SenderAvatar = sender.AvatarUrl,
                         Content = message,
                         Timestamp = newMessage.SentAt
                     });
@@ -348,6 +428,8 @@ public class FriendHub : Hub
             {
                 ChatId = chatId,
                 MessageId = newMessage.Id,
+                SenderId = senderId, // Use IdentityUserId for frontend
+                SenderName = sender.UserName ?? "Unknown User",
                 Content = message,
                 Timestamp = newMessage.SentAt
             });
@@ -372,6 +454,16 @@ public class FriendHub : Hub
                 return;
             }
 
+            // Convert IdentityUserId to MongoDB _id for database queries
+            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                await Clients.Caller.SendAsync("Error", "User not found");
+                return;
+            }
+
+            var userMongoId = user.Id;
+
             var message = await _context.Messages.Find(m => m.Id == messageId).FirstOrDefaultAsync();
             if (message == null)
             {
@@ -381,7 +473,7 @@ public class FriendHub : Hub
 
             // Check if user is participant in the chat
             var chat = await _context.Chats.Find(c => c.Id == message.ChatId).FirstOrDefaultAsync();
-            if (chat == null || !chat.Participants.Contains(userId))
+            if (chat == null || !chat.Participants.Contains(userMongoId))
             {
                 await Clients.Caller.SendAsync("Error", "Access denied");
                 return;
@@ -390,19 +482,26 @@ public class FriendHub : Hub
             // Mark as read
             var readBy = new MessageRead
             {
-                UserId = userId,
+                UserId = userMongoId, // Store MongoDB _id
                 ReadAt = DateTime.UtcNow
             };
             var update = Builders<Message>.Update.Push(m => m.ReadBy, readBy);
             await _context.Messages.UpdateOneAsync(m => m.Id == messageId, update);
 
+            // Get sender IdentityUserId for notification
+            var sender = await _context.Users.Find(u => u.Id == message.SenderId).FirstOrDefaultAsync();
+            var senderIdentityId = sender?.IdentityUserId;
+
             // Notify message sender
-            await Clients.Group($"user_{message.SenderId}").SendAsync("MessageRead", new
+            if (!string.IsNullOrEmpty(senderIdentityId))
             {
-                MessageId = messageId,
-                ReadBy = userId,
-                Timestamp = DateTime.UtcNow
-            });
+                await Clients.Group($"user_{senderIdentityId}").SendAsync("MessageRead", new
+                {
+                    MessageId = messageId,
+                    ReadBy = userId, // Use IdentityUserId for frontend
+                    Timestamp = DateTime.UtcNow
+                });
+            }
 
             _logger.LogInformation($"Message {messageId} marked as read by {userId}");
         }
@@ -424,17 +523,33 @@ public class FriendHub : Hub
                 return;
             }
 
+            // Convert IdentityUserIds to MongoDB _ids for database queries
+            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
+            var friend = await _context.Users.Find(u => u.IdentityUserId == friendId).FirstOrDefaultAsync();
+            
+            if (user == null || friend == null)
+            {
+                await Clients.Caller.SendAsync("Error", "User not found");
+                return;
+            }
+
+            var userMongoId = user.Id;
+            var friendMongoId = friend.Id;
+
             // Check if chat already exists
             var existingChat = await _context.Chats
-                .Find(c => c.Participants.Contains(userId) && c.Participants.Contains(friendId))
+                .Find(c => c.Participants.Contains(userMongoId) && c.Participants.Contains(friendMongoId))
                 .FirstOrDefaultAsync();
 
             if (existingChat != null)
             {
+                // Convert MongoDB _ids back to IdentityUserIds for frontend
+                var participants = new List<string> { userId, friendId };
+                
                 await Clients.Caller.SendAsync("ChatCreated", new
                 {
                     ChatId = existingChat.Id,
-                    Participants = existingChat.Participants,
+                    Participants = participants, // Use IdentityUserIds for frontend
                     CreatedAt = existingChat.CreatedAt
                 });
                 return;
@@ -443,25 +558,28 @@ public class FriendHub : Hub
             // Create new chat
             var newChat = new Chat
             {
-                Participants = new List<string> { userId, friendId },
+                Participants = new List<string> { userMongoId, friendMongoId }, // Store MongoDB _ids
                 CreatedAt = DateTime.UtcNow,
                 LastActivity = DateTime.UtcNow
             };
 
             await _context.Chats.InsertOneAsync(newChat);
 
+            // Convert MongoDB _ids back to IdentityUserIds for frontend
+            var chatParticipants = new List<string> { userId, friendId };
+
             // Notify both users
             await Clients.Group($"user_{userId}").SendAsync("ChatCreated", new
             {
                 ChatId = newChat.Id,
-                Participants = newChat.Participants,
+                Participants = chatParticipants, // Use IdentityUserIds for frontend
                 CreatedAt = newChat.CreatedAt
             });
 
             await Clients.Group($"user_{friendId}").SendAsync("ChatCreated", new
             {
                 ChatId = newChat.Id,
-                Participants = newChat.Participants,
+                Participants = chatParticipants, // Use IdentityUserIds for frontend
                 CreatedAt = newChat.CreatedAt
             });
 
@@ -477,37 +595,106 @@ public class FriendHub : Hub
     // Utility Methods
     private string? GetUserIdFromContext()
     {
-        // In a real app, you'd get this from JWT token or session
-        // For now, we'll use a query parameter or header
-        var userId = Context.GetHttpContext()?.Request.Query["userId"].FirstOrDefault();
-        if (string.IsNullOrEmpty(userId))
+        // Debug: Log the request details
+        var httpContext = Context.GetHttpContext();
+        var accessToken = httpContext?.Request.Query["access_token"].FirstOrDefault();
+        _logger.LogInformation($"Access token from query: {!string.IsNullOrEmpty(accessToken)}");
+        if (!string.IsNullOrEmpty(accessToken))
         {
-            // Try to get from headers
-            userId = Context.GetHttpContext()?.Request.Headers["X-User-Id"].FirstOrDefault();
+            _logger.LogInformation($"Access token length: {accessToken.Length}");
+            _logger.LogInformation($"Access token preview: {accessToken.Substring(0, Math.Min(20, accessToken.Length))}...");
         }
-        return userId;
+        
+        // Try to get from JWT token first
+        var user = Context.User;
+        _logger.LogInformation($"Context.User is null: {user == null}");
+        if (user != null)
+        {
+            _logger.LogInformation($"User.Identity is null: {user.Identity == null}");
+            if (user.Identity != null)
+            {
+                _logger.LogInformation($"User.Identity.IsAuthenticated: {user.Identity.IsAuthenticated}");
+                _logger.LogInformation($"User.Identity.Name: {user.Identity.Name}");
+            }
+        }
+        
+        if (user?.Identity?.IsAuthenticated == true)
+        {
+            _logger.LogInformation($"User is authenticated: {user.Identity.Name}");
+            _logger.LogInformation($"User claims: {string.Join(", ", user.Claims.Select(c => $"{c.Type}={c.Value}"))}");
+            
+            var userIdClaim = user.FindFirst("sub") ?? 
+                             user.FindFirst("userId") ?? 
+                             user.FindFirst("nameid") ?? 
+                             user.FindFirst("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier");
+            if (userIdClaim != null)
+            {
+                _logger.LogInformation($"Found userId from JWT claim: {userIdClaim.Value}");
+                return userIdClaim.Value;
+            }
+            else
+            {
+                _logger.LogWarning("User is authenticated but no userId claim found in JWT token");
+            }
+        }
+        else
+        {
+            _logger.LogWarning($"User is not authenticated. Identity: {user?.Identity?.Name}, IsAuthenticated: {user?.Identity?.IsAuthenticated}");
+        }
+
+        // Fallback to query parameter or header (for development/testing)
+        var userId = Context.GetHttpContext()?.Request.Query["userId"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(userId))
+        {
+            _logger.LogInformation($"Using userId from query parameter: {userId}");
+            return userId;
+        }
+        
+        userId = Context.GetHttpContext()?.Request.Headers["X-User-Id"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(userId))
+        {
+            _logger.LogInformation($"Using userId from header: {userId}");
+            return userId;
+        }
+        
+        _logger.LogWarning("No userId found in JWT claims, query parameters, or headers");
+        return null;
     }
 
     private async Task NotifyFriendsOnlineStatus(string userId, bool isOnline)
     {
         try
         {
-            // Get user's friends
+            // Convert IdentityUserId to MongoDB _id for database queries
+            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                _logger.LogWarning($"User not found for IdentityUserId: {userId}");
+                return;
+            }
+
+            var userMongoId = user.Id;
+
+            // Get user's friends using MongoDB _id
             var friends = await _context.Friends
-                .Find(f => (f.UserId == userId || f.FriendId == userId) && f.Status == FriendStatus.Accepted)
+                .Find(f => (f.UserId == userMongoId || f.FriendId == userMongoId) && f.Status == FriendStatus.Accepted)
                 .ToListAsync();
 
-            var friendIds = friends.Select(f => f.UserId == userId ? f.FriendId : f.UserId).ToList();
+            var friendMongoIds = friends.Select(f => f.UserId == userMongoId ? f.FriendId : f.UserId).ToList();
 
-            // Get user info
-            var user = await _context.Users.Find(u => u.Id == userId).FirstOrDefaultAsync();
+            // Get friend IdentityUserIds for SignalR groups
+            var friendUsers = await _context.Users
+                .Find(u => friendMongoIds.Contains(u.Id))
+                .ToListAsync();
 
-            foreach (var friendId in friendIds)
+            var friendIdentityIds = friendUsers.Select(u => u.IdentityUserId).ToList();
+
+            foreach (var friendIdentityId in friendIdentityIds)
             {
-                await Clients.Group($"user_{friendId}").SendAsync("FriendStatusChanged", new
+                await Clients.Group($"user_{friendIdentityId}").SendAsync("FriendStatusChanged", new
                 {
-                    FriendId = userId,
-                    FriendName = user?.UserName ?? "Unknown User",
+                    FriendId = userId, // Use IdentityUserId for frontend
+                    FriendName = user.UserName ?? "Unknown User",
                     IsOnline = isOnline,
                     Timestamp = DateTime.UtcNow
                 });
@@ -531,13 +718,31 @@ public class FriendHub : Hub
                 return;
             }
 
-            // Get user's friends
+            // Convert IdentityUserId to MongoDB _id for database queries
+            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                _logger.LogWarning($"User not found for IdentityUserId: {userId}");
+                await Clients.Caller.SendAsync("Error", "User not found");
+                return;
+            }
+
+            var userMongoId = user.Id;
+
+            // Get user's friends using MongoDB _id
             var friends = await _context.Friends
-                .Find(f => (f.UserId == userId || f.FriendId == userId) && f.Status == FriendStatus.Accepted)
+                .Find(f => (f.UserId == userMongoId || f.FriendId == userMongoId) && f.Status == FriendStatus.Accepted)
                 .ToListAsync();
 
-            var friendIds = friends.Select(f => f.UserId == userId ? f.FriendId : f.UserId).ToList();
-            var onlineFriends = friendIds.Where(id => _userConnections.ContainsKey(id)).ToList();
+            var friendMongoIds = friends.Select(f => f.UserId == userMongoId ? f.FriendId : f.UserId).ToList();
+
+            // Get friend IdentityUserIds for online status check
+            var friendUsers = await _context.Users
+                .Find(u => friendMongoIds.Contains(u.Id))
+                .ToListAsync();
+
+            var friendIdentityIds = friendUsers.Select(u => u.IdentityUserId).ToList();
+            var onlineFriends = friendIdentityIds.Where(id => _userConnections.ContainsKey(id)).ToList();
 
             await Clients.Caller.SendAsync("OnlineFriends", onlineFriends);
         }
