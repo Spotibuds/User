@@ -366,6 +366,7 @@ public class ChatsController : ControllerBase
                 messageId = m.Id,
                 chatId = m.ChatId,
                 senderId = sender?.IdentityUserId ?? m.SenderId,
+                senderName = sender?.UserName ?? "Unknown User",
                 content = m.Content,
                 type = m.Type.ToString(),
                 sentAt = m.SentAt,

@@ -5,6 +5,7 @@ using User.Entities;
 using User.Models;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
+using System.Net.Http;
 
 namespace User.Hubs;
 
@@ -42,6 +43,32 @@ public class FriendHub : Hub
                 _logger.LogWarning($"Unauthorized connection attempt: {Context.ConnectionId}");
                 Context.Abort();
                 return;
+            }
+
+            // Check if user exists in MongoDB, if not, try to create them
+            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                _logger.LogWarning($"User {userId} not found in MongoDB, attempting to create from Identity service");
+                
+                // Try to get user info from Identity service and create in MongoDB
+                try
+                {
+                    user = await CreateUserFromIdentityService(userId);
+                    if (user == null)
+                    {
+                        _logger.LogError($"Failed to create user {userId} in MongoDB from Identity service");
+                        Context.Abort();
+                        return;
+                    }
+                    _logger.LogInformation($"Successfully created user {userId} in MongoDB from Identity service");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Error creating user {userId} in MongoDB from Identity service");
+                    Context.Abort();
+                    return;
+                }
             }
 
             // Store user connection mapping
@@ -150,14 +177,14 @@ public class FriendHub : Hub
                 SenderId = senderId, // Use IdentityUserId for frontend
                 SenderName = sender.UserName ?? "Unknown User",
                 SenderAvatar = sender.AvatarUrl,
-                Timestamp = friendRequest.CreatedAt
+                Timestamp = friendRequest.CreatedAt.ToString("O") // ISO 8601 format
             });
 
             await Clients.Caller.SendAsync("FriendRequestSent", new
             {
                 RequestId = friendRequest.Id,
                 TargetUserId = targetUserId, // Use IdentityUserId for frontend
-                Timestamp = friendRequest.CreatedAt
+                Timestamp = friendRequest.CreatedAt.ToString("O") // ISO 8601 format
             });
 
             _logger.LogInformation($"Friend request sent from {senderId} to {targetUserId}");
@@ -214,7 +241,7 @@ public class FriendHub : Hub
                     AcceptedBy = userId, // Use IdentityUserId for frontend
                     AcceptedByName = user.UserName ?? "Unknown User",
                     AcceptedByAvatar = user.AvatarUrl,
-                    Timestamp = DateTime.UtcNow
+                    Timestamp = DateTime.UtcNow.ToString("O") // ISO 8601 format
                 });
             }
 
@@ -224,7 +251,7 @@ public class FriendHub : Hub
                 FriendId = friendIdentityId ?? friendRequest.UserId, // Use IdentityUserId for frontend
                 FriendName = friend?.UserName ?? "Unknown User",
                 FriendAvatar = friend?.AvatarUrl,
-                Timestamp = DateTime.UtcNow
+                Timestamp = DateTime.UtcNow.ToString("O") // ISO 8601 format
             });
 
             _logger.LogInformation($"Friend request {requestId} accepted by {userId}");
@@ -278,14 +305,14 @@ public class FriendHub : Hub
                 {
                     RequestId = requestId,
                     DeclinedBy = userId, // Use IdentityUserId for frontend
-                    Timestamp = DateTime.UtcNow
+                    Timestamp = DateTime.UtcNow.ToString("O") // ISO 8601 format
                 });
             }
 
             await Clients.Caller.SendAsync("FriendRequestDeclined", new
             {
                 RequestId = requestId,
-                Timestamp = DateTime.UtcNow
+                Timestamp = DateTime.UtcNow.ToString("O") // ISO 8601 format
             });
 
             _logger.LogInformation($"Friend request {requestId} declined by {userId}");
@@ -418,12 +445,12 @@ public class FriendHub : Hub
                         SenderName = sender.UserName ?? "Unknown User",
                         SenderAvatar = sender.AvatarUrl,
                         Content = message,
-                        Timestamp = newMessage.SentAt
+                        Timestamp = newMessage.SentAt.ToString("O") // ISO 8601 format
                     });
                 }
             }
 
-            // Confirm message sent to sender
+            // Confirm message sent to sender with complete sender information
             await Clients.Caller.SendAsync("MessageSent", new
             {
                 ChatId = chatId,
@@ -431,7 +458,7 @@ public class FriendHub : Hub
                 SenderId = senderId, // Use IdentityUserId for frontend
                 SenderName = sender.UserName ?? "Unknown User",
                 Content = message,
-                Timestamp = newMessage.SentAt
+                Timestamp = newMessage.SentAt.ToString("O") // ISO 8601 format
             });
 
             _logger.LogInformation($"Message sent in chat {chatId} by {senderId}");
@@ -661,6 +688,61 @@ public class FriendHub : Hub
         return null;
     }
 
+    private async Task<Models.User?> CreateUserFromIdentityService(string identityUserId)
+    {
+        try
+        {
+            // Get Identity service URL from configuration
+            var identityServiceUrl = Environment.GetEnvironmentVariable("IDENTITY_SERVICE_URL") ?? "http://localhost:5000";
+            
+            using var httpClient = new HttpClient();
+            httpClient.Timeout = TimeSpan.FromSeconds(10);
+            
+            // Get user info from Identity service
+            var response = await httpClient.GetAsync($"{identityServiceUrl}/api/auth/users/{identityUserId}");
+            
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning($"Failed to get user {identityUserId} from Identity service: {response.StatusCode}");
+                return null;
+            }
+            
+            var userJson = await response.Content.ReadAsStringAsync();
+            var userData = System.Text.Json.JsonSerializer.Deserialize<IdentityUserData>(userJson);
+            
+            if (userData == null)
+            {
+                _logger.LogWarning($"Failed to deserialize user data for {identityUserId}");
+                return null;
+            }
+            
+            // Create user in MongoDB
+            var newUser = new Models.User
+            {
+                IdentityUserId = identityUserId,
+                UserName = userData.UserName ?? "Unknown",
+                DisplayName = userData.DisplayName ?? "",
+                Bio = "",
+                AvatarUrl = null,
+                IsPrivate = userData.IsPrivate,
+                Playlists = new List<Models.PlaylistReference>(),
+                FollowedUsers = new List<Models.UserReference>(),
+                Followers = new List<Models.UserReference>(),
+                CreatedAt = DateTime.UtcNow
+            };
+            
+            await _context.Users.InsertOneAsync(newUser);
+            _logger.LogInformation($"Created user {identityUserId} in MongoDB with MongoDB ID: {newUser.Id}");
+            
+            return newUser;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Error creating user {identityUserId} from Identity service");
+            return null;
+        }
+    }
+
     private async Task NotifyFriendsOnlineStatus(string userId, bool isOnline)
     {
         try
@@ -752,4 +834,16 @@ public class FriendHub : Hub
             await Clients.Caller.SendAsync("Error", "Failed to get online friends");
         }
     }
+
+}
+
+// Helper class for deserializing Identity service response
+public class IdentityUserData
+{
+    public string Id { get; set; } = string.Empty;
+    public string UserName { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string? DisplayName { get; set; }
+    public bool IsPrivate { get; set; }
+    public DateTime CreatedAt { get; set; }
 } 

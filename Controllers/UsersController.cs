@@ -36,7 +36,7 @@ public class UsersController : ControllerBase
         {
             // Get users from Identity service
             using var httpClient = new HttpClient();
-            httpClient.BaseAddress = new Uri("http://localhost:5001/");
+            httpClient.BaseAddress = new Uri("http://localhost:5000/");
             
             var identityUsersResponse = await httpClient.GetAsync("api/auth/users");
             
@@ -108,7 +108,94 @@ public class UsersController : ControllerBase
         }
     }
 
-        [HttpGet("all")]
+    [HttpPost("sync-user/{identityUserId}")]
+    public async Task<ActionResult<string>> SyncSpecificUser(string identityUserId)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        try
+        {
+            // Check if user already exists in MongoDB
+            var existingUser = await _context.Users.Find(u => u.IdentityUserId == identityUserId).FirstOrDefaultAsync();
+            if (existingUser != null)
+            {
+                return Ok($"User {identityUserId} already exists in MongoDB");
+            }
+
+            // Get user from Identity service
+            using var httpClient = new HttpClient();
+            httpClient.BaseAddress = new Uri("http://localhost:5000/");
+            
+            var response = await httpClient.GetAsync($"api/auth/users/{identityUserId}");
+            
+            if (!response.IsSuccessStatusCode)
+            {
+                return StatusCode(500, $"Failed to get user {identityUserId} from Identity service. Status: {response.StatusCode}");
+            }
+
+            var userJson = await response.Content.ReadAsStringAsync();
+            var identityUser = System.Text.Json.JsonSerializer.Deserialize<IdentityUserDto>(userJson);
+            
+            if (identityUser == null)
+            {
+                return StatusCode(500, $"Failed to deserialize user data for {identityUserId}");
+            }
+
+            // Create user in MongoDB
+            var newUser = new Models.User
+            {
+                IdentityUserId = identityUser.Id,
+                UserName = identityUser.UserName ?? "Unknown",
+                DisplayName = identityUser.UserName ?? "Unknown",
+                Bio = null,
+                AvatarUrl = null,
+                IsPrivate = identityUser.IsPrivate ?? false,
+                Playlists = new List<PlaylistReference>(),
+                FollowedUsers = new List<UserReference>(),
+                Followers = new List<UserReference>(),
+                CreatedAt = identityUser.CreatedAt ?? DateTime.UtcNow
+            };
+
+            await _context.Users.InsertOneAsync(newUser);
+            
+            return Ok($"Successfully created user {identityUserId} in MongoDB with MongoDB ID: {newUser.Id}");
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error syncing user {identityUserId}: {ex.Message}");
+        }
+    }
+
+    [HttpGet("check/{identityUserId}")]
+    public async Task<ActionResult<object>> CheckUserExists(string identityUserId)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        try
+        {
+            var user = await _context.Users.Find(u => u.IdentityUserId == identityUserId).FirstOrDefaultAsync();
+            
+            return Ok(new
+            {
+                exists = user != null,
+                userId = identityUserId,
+                mongoId = user?.Id,
+                userName = user?.UserName
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error checking user {identityUserId}: {ex.Message}");
+        }
+    }
+
+    [HttpGet("all")]
     public async Task<ActionResult<IEnumerable<UserDto>>> GetUsers()
     {
                 if (!_context.IsConnected || _context.Users == null)

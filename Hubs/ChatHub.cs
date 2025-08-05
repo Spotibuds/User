@@ -38,31 +38,43 @@ public class ChatHub : Hub
         await base.OnDisconnectedAsync(exception);
     }
 
-    public async Task JoinChat(string chatId)
+    // In User/Hubs/ChatHub.cs
+public async Task JoinChat(string chatId)
+{
+    var userId = Context.UserIdentifier?.ToString();
+    if (string.IsNullOrEmpty(userId))
     {
-        var userId = Context.UserIdentifier?.ToString();
-        if (string.IsNullOrEmpty(userId))
-        {
-            await Clients.Caller.SendAsync("Error", "User not authenticated");
-            return;
-        }
-
-        // Verify user has access to this chat
-        var chat = await _context.Chats
-            .Find(c => c.Id == chatId && c.Participants.Contains(userId))
-            .FirstOrDefaultAsync();
-
-        if (chat == null)
-        {
-            await Clients.Caller.SendAsync("Error", "Chat not found or access denied");
-            return;
-        }
-
-        await Groups.AddToGroupAsync(Context.ConnectionId, $"chat_{chatId}");
-        await Clients.Caller.SendAsync("JoinedChat", chatId);
-        
-        _logger.LogInformation($"User {userId} joined chat {chatId}");
+        await Clients.Caller.SendAsync("Error", "User not authenticated");
+        return;
     }
+
+    // Get MongoDB user by IdentityUserId
+    var user = await _context.Users
+        .Find(u => u.IdentityUserId == userId)
+        .FirstOrDefaultAsync();
+        
+    if (user == null)
+    {
+        await Clients.Caller.SendAsync("Error", "User not found");
+        return;
+    }
+
+    // Now use the MongoDB _id to check chat participation
+    var chat = await _context.Chats
+        .Find(c => c.Id == chatId && c.Participants.Contains(user.Id))
+        .FirstOrDefaultAsync();
+
+    if (chat == null)
+    {
+        await Clients.Caller.SendAsync("Error", "Chat not found or access denied");
+        return;
+    }
+
+    await Groups.AddToGroupAsync(Context.ConnectionId, $"chat_{chatId}");
+    await Clients.Caller.SendAsync("JoinedChat", chatId);
+    
+    _logger.LogInformation($"User {userId} joined chat {chatId}");
+}
 
     public async Task LeaveChat(string chatId)
     {
@@ -76,6 +88,7 @@ public class ChatHub : Hub
     public async Task SendMessage(string chatId, string content)
     {
         var userId = Context.UserIdentifier?.ToString();
+        _logger.LogInformation($"SendMessage called: chatId={chatId}, content={content}, userId={userId}, connectionId={Context.ConnectionId}");
         if (string.IsNullOrEmpty(userId))
         {
             await Clients.Caller.SendAsync("Error", "User not authenticated");
