@@ -274,17 +274,38 @@ builder.Services.AddSingleton<User.Services.IRabbitMqService>(serviceProvider =>
 });
 
 // CORS Configuration
+var corsSection = builder.Configuration.GetSection("Cors");
+var allowedOrigins = corsSection["AllowedOrigins"];
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy
-            .WithOrigins("http://localhost:3000") // Your frontend URL
-            .AllowAnyMethod()
-            .AllowAnyHeader()
-            .AllowCredentials() // Required for SignalR
-            .WithExposedHeaders("Content-Disposition") // Add any custom headers you need to expose
-            .SetIsOriginAllowed(origin => true); // Be more restrictive in production
+        if (allowedOrigins == "*")
+        {
+            policy.AllowAnyOrigin()
+                .AllowAnyMethod()
+                .AllowAnyHeader()
+                .WithExposedHeaders("Content-Disposition");
+        }
+        else if (!string.IsNullOrEmpty(allowedOrigins))
+        {
+            var origins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries);
+            policy.WithOrigins(origins)
+                .AllowAnyMethod()
+                .AllowAnyHeader()
+                .AllowCredentials() // Required for SignalR
+                .WithExposedHeaders("Content-Disposition");
+        }
+        else
+        {
+            // Fallback for development
+            policy.WithOrigins("http://localhost:3000")
+                .AllowAnyMethod()
+                .AllowAnyHeader()
+                .AllowCredentials()
+                .WithExposedHeaders("Content-Disposition");
+        }
     });
 });
 
