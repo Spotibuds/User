@@ -277,12 +277,30 @@ builder.Services.AddSingleton<User.Services.IRabbitMqService>(serviceProvider =>
 var corsSection = builder.Configuration.GetSection("Cors");
 var allowedOrigins = corsSection["AllowedOrigins"];
 
+Console.WriteLine($"CORS Configuration Debug:");
+Console.WriteLine($"Cors:AllowedOrigins from config: '{allowedOrigins}'");
+Console.WriteLine($"Environment ASPNETCORE_ENVIRONMENT: {builder.Environment.EnvironmentName}");
+
+// Also try reading directly from environment variable
+var envCorsOrigins = Environment.GetEnvironmentVariable("Cors__AllowedOrigins");
+Console.WriteLine($"Cors__AllowedOrigins from environment: '{envCorsOrigins}'");
+
+// Use environment variable if config is empty
+if (string.IsNullOrEmpty(allowedOrigins) && !string.IsNullOrEmpty(envCorsOrigins))
+{
+    allowedOrigins = envCorsOrigins;
+    Console.WriteLine($"Using CORS origins from environment variable: '{allowedOrigins}'");
+}
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
+        Console.WriteLine($"Setting up CORS policy with origins: '{allowedOrigins}'");
+        
         if (allowedOrigins == "*")
         {
+            Console.WriteLine("CORS: Allowing all origins");
             policy.AllowAnyOrigin()
                 .AllowAnyMethod()
                 .AllowAnyHeader()
@@ -291,6 +309,7 @@ builder.Services.AddCors(options =>
         else if (!string.IsNullOrEmpty(allowedOrigins))
         {
             var origins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries);
+            Console.WriteLine($"CORS: Allowing specific origins: {string.Join(", ", origins)}");
             policy.WithOrigins(origins)
                 .AllowAnyMethod()
                 .AllowAnyHeader()
@@ -299,6 +318,7 @@ builder.Services.AddCors(options =>
         }
         else
         {
+            Console.WriteLine("CORS: No origins configured, using localhost fallback");
             // Fallback for development
             policy.WithOrigins("http://localhost:3000")
                 .AllowAnyMethod()
@@ -473,5 +493,15 @@ app.MapGet("/health/mongodb", async (MongoDbContext dbContext) =>
 
 // Simple MongoDB connection test endpoint
 
+// CORS configuration test endpoint
+app.MapGet("/cors-config", (IConfiguration config) => new { 
+    corsFromConfig = config.GetSection("Cors")["AllowedOrigins"],
+    corsFromEnv = Environment.GetEnvironmentVariable("Cors__AllowedOrigins"),
+    environment = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT"),
+    allEnvVars = Environment.GetEnvironmentVariables()
+        .Cast<System.Collections.DictionaryEntry>()
+        .Where(x => x.Key.ToString().Contains("Cors"))
+        .ToDictionary(x => x.Key.ToString(), x => x.Value.ToString())
+});
 
 app.Run(); 
