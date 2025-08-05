@@ -298,15 +298,7 @@ builder.Services.AddCors(options =>
     {
         Console.WriteLine($"Setting up CORS policy with origins: '{allowedOrigins}'");
         
-        if (allowedOrigins == "*")
-        {
-            Console.WriteLine("CORS: Allowing all origins");
-            policy.AllowAnyOrigin()
-                .AllowAnyMethod()
-                .AllowAnyHeader()
-                .WithExposedHeaders("Content-Disposition");
-        }
-        else if (!string.IsNullOrEmpty(allowedOrigins))
+        if (!string.IsNullOrEmpty(allowedOrigins))
         {
             var origins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries);
             Console.WriteLine($"CORS: Allowing specific origins: {string.Join(", ", origins)}");
@@ -318,9 +310,10 @@ builder.Services.AddCors(options =>
         }
         else
         {
-            Console.WriteLine("CORS: No origins configured, using localhost fallback");
-            // Fallback for development
-            policy.WithOrigins("http://localhost:3000")
+            Console.WriteLine("CORS: No origins configured, blocking all requests for security");
+            // For security, if no origins are configured, we shouldn't allow any origins
+            // This forces proper configuration through environment variables
+            policy.WithOrigins() // Empty origins array - blocks all cross-origin requests
                 .AllowAnyMethod()
                 .AllowAnyHeader()
                 .AllowCredentials()
