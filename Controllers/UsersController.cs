@@ -561,7 +561,176 @@ public class UsersController : ControllerBase
         return NoContent();
     }
 
+    // Listening History endpoints
+    [HttpPost("{userId}/listening-history")]
+    public async Task<ActionResult> AddToListeningHistory(string userId, [FromBody] AddListeningHistoryDto dto)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
 
+        try
+        {
+            var historyItem = new ListeningHistoryItem
+            {
+                SongId = dto.SongId,
+                SongTitle = dto.SongTitle,
+                Artist = dto.Artist,
+                CoverUrl = dto.CoverUrl,
+                PlayedAt = DateTime.UtcNow,
+                Duration = dto.Duration
+            };
+
+            var filter = Builders<Models.User>.Filter.Eq(u => u.Id, userId);
+            
+            // First, add the item to the history
+            var pushUpdate = Builders<Models.User>.Update
+                .Push(u => u.ListeningHistory, historyItem);
+
+            await _context.Users.UpdateOneAsync(filter, pushUpdate);
+
+            // Then, limit to last 100 items by removing older items
+            var user = await _context.Users.Find(filter).FirstOrDefaultAsync();
+            if (user != null && user.ListeningHistory.Count > 100)
+            {
+                var limitedHistory = user.ListeningHistory
+                    .OrderByDescending(h => h.PlayedAt)
+                    .Take(100)
+                    .ToList();
+                
+                var replaceUpdate = Builders<Models.User>.Update
+                    .Set(u => u.ListeningHistory, limitedHistory);
+                
+                await _context.Users.UpdateOneAsync(filter, replaceUpdate);
+            }
+
+            return Ok();
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error adding to listening history: {ex.Message}");
+        }
+    }
+
+    [HttpPost("identity/{identityUserId}/listening-history")]
+    public async Task<ActionResult> AddToListeningHistoryByIdentity(string identityUserId, [FromBody] AddListeningHistoryDto dto)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        try
+        {
+            var historyItem = new ListeningHistoryItem
+            {
+                SongId = dto.SongId,
+                SongTitle = dto.SongTitle,
+                Artist = dto.Artist,
+                CoverUrl = dto.CoverUrl,
+                PlayedAt = DateTime.UtcNow,
+                Duration = dto.Duration
+            };
+
+            var filter = Builders<Models.User>.Filter.Eq(u => u.IdentityUserId, identityUserId);
+            
+            // First, add the item to the history
+            var pushUpdate = Builders<Models.User>.Update
+                .Push(u => u.ListeningHistory, historyItem);
+
+            await _context.Users.UpdateOneAsync(filter, pushUpdate);
+
+            // Then, limit to last 100 items by removing older items
+            var user = await _context.Users.Find(filter).FirstOrDefaultAsync();
+            if (user != null && user.ListeningHistory.Count > 100)
+            {
+                var limitedHistory = user.ListeningHistory
+                    .OrderByDescending(h => h.PlayedAt)
+                    .Take(100)
+                    .ToList();
+                
+                var replaceUpdate = Builders<Models.User>.Update
+                    .Set(u => u.ListeningHistory, limitedHistory);
+                
+                await _context.Users.UpdateOneAsync(filter, replaceUpdate);
+            }
+
+            return Ok(new { success = true, message = "Added to listening history" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error adding to listening history: {ex.Message}");
+        }
+    }
+
+    [HttpGet("{userId}/listening-history")]
+    public async Task<ActionResult<List<ListeningHistoryItem>>> GetListeningHistory(string userId, int limit = 50, int skip = 0)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        try
+        {
+            var filter = Builders<Models.User>.Filter.Eq(u => u.Id, userId);
+            var projection = Builders<Models.User>.Projection.Include(u => u.ListeningHistory);
+            
+            var user = await _context.Users.Find(filter).Project<Models.User>(projection).FirstOrDefaultAsync();
+            
+            if (user == null)
+            {
+                return NotFound("User not found");
+            }
+
+            var history = user.ListeningHistory
+                .OrderByDescending(h => h.PlayedAt)
+                .Skip(skip)
+                .Take(limit)
+                .ToList();
+
+            return Ok(history);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error retrieving listening history: {ex.Message}");
+        }
+    }
+
+    [HttpGet("identity/{identityUserId}/listening-history")]
+    public async Task<ActionResult<List<ListeningHistoryItem>>> GetListeningHistoryByIdentity(string identityUserId, int limit = 50, int skip = 0)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        try
+        {
+            var filter = Builders<Models.User>.Filter.Eq(u => u.IdentityUserId, identityUserId);
+            var projection = Builders<Models.User>.Projection.Include(u => u.ListeningHistory);
+            
+            var user = await _context.Users.Find(filter).Project<Models.User>(projection).FirstOrDefaultAsync();
+            
+            if (user == null)
+            {
+                return NotFound("User not found");
+            }
+
+            var history = user.ListeningHistory
+                .OrderByDescending(h => h.PlayedAt)
+                .Skip(skip)
+                .Take(limit)
+                .ToList();
+
+            return Ok(history);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error retrieving listening history: {ex.Message}");
+        }
+    }
 
 
 }
@@ -619,4 +788,11 @@ public class IdentityUserDto
     public DateTime? CreatedAt { get; set; }
 }
 
- 
+public class AddListeningHistoryDto
+{
+    public string SongId { get; set; } = string.Empty;
+    public string SongTitle { get; set; } = string.Empty;
+    public string Artist { get; set; } = string.Empty;
+    public string? CoverUrl { get; set; }
+    public int Duration { get; set; } = 0; // Duration listened in seconds
+}

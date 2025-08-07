@@ -37,6 +37,9 @@ public class User
     [BsonElement("Followers")]
     public List<UserReference> Followers { get; set; } = new();
 
+    [BsonElement("ListeningHistory")]
+    public List<ListeningHistoryItem> ListeningHistory { get; set; } = new();
+
     [BsonElement("CreatedAt")]
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
@@ -54,4 +57,25 @@ public class UserReference
 {
     [BsonElement("Id")]
     public string Id { get; set; } = string.Empty;
+}
+
+public class ListeningHistoryItem
+{
+    [BsonElement("SongId")]
+    public string SongId { get; set; } = string.Empty;
+
+    [BsonElement("SongTitle")]
+    public string SongTitle { get; set; } = string.Empty;
+
+    [BsonElement("Artist")]
+    public string Artist { get; set; } = string.Empty;
+
+    [BsonElement("CoverUrl")]
+    public string? CoverUrl { get; set; }
+
+    [BsonElement("PlayedAt")]
+    public DateTime PlayedAt { get; set; } = DateTime.UtcNow;
+
+    [BsonElement("Duration")]
+    public int Duration { get; set; } // Duration listened in seconds
 } 

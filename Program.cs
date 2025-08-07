@@ -300,13 +300,24 @@ builder.Services.AddCors(options =>
         
         if (!string.IsNullOrEmpty(allowedOrigins))
         {
-            var origins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries);
-            Console.WriteLine($"CORS: Allowing specific origins: {string.Join(", ", origins)}");
-            policy.WithOrigins(origins)
-                .AllowAnyMethod()
-                .AllowAnyHeader()
-                .AllowCredentials() // Required for SignalR
-                .WithExposedHeaders("Content-Disposition");
+            if (allowedOrigins == "*")
+            {
+                Console.WriteLine("CORS: Wildcard origin detected, allowing all origins without credentials for development");
+                policy.AllowAnyOrigin()
+                    .AllowAnyMethod()
+                    .AllowAnyHeader()
+                    .WithExposedHeaders("Content-Disposition");
+            }
+            else
+            {
+                var origins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries);
+                Console.WriteLine($"CORS: Allowing specific origins: {string.Join(", ", origins)}");
+                policy.WithOrigins(origins)
+                    .AllowAnyMethod()
+                    .AllowAnyHeader()
+                    .AllowCredentials() // Required for SignalR
+                    .WithExposedHeaders("Content-Disposition");
+            }
         }
         else
         {
