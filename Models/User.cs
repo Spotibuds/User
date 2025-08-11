@@ -40,6 +40,13 @@ public class User
     [BsonElement("ListeningHistory")]
     public List<ListeningHistoryItem> ListeningHistory { get; set; } = new();
 
+    // Cached weekly top artists calculated at the start of each week
+    [BsonElement("TopArtistsWeekStart")]
+    public DateTime? TopArtistsWeekStart { get; set; }
+
+    [BsonElement("TopArtistsCurrentWeek")]
+    public List<TopArtist> TopArtistsCurrentWeek { get; set; } = new();
+
     [BsonElement("CreatedAt")]
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
@@ -79,3 +86,12 @@ public class ListeningHistoryItem
     [BsonElement("Duration")]
     public int Duration { get; set; } // Duration listened in seconds
 } 
+
+public class TopArtist
+{
+    [BsonElement("Name")]
+    public string Name { get; set; } = string.Empty;
+
+    [BsonElement("Count")]
+    public int Count { get; set; }
+}

@@ -254,6 +254,8 @@ builder.Services.AddScoped<MongoDbContext>(serviceProvider =>
     options.PayloadSerializerOptions.ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.Preserve;
 });// Register services
 builder.Services.AddScoped<User.Services.IFriendNotificationService, User.Services.FriendNotificationService>();
+// Register weekly background job for Top Artists
+builder.Services.AddHostedService<User.Services.WeeklyTopArtistsService>();
 
 // Register RabbitMQ service as optional - only if connection is available
 builder.Services.AddSingleton<User.Services.IRabbitMqService>(serviceProvider =>

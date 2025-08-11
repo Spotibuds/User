@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using MongoDB.Driver;
 using User.Data;
 using User.Models;
+using Microsoft.Extensions.Hosting;
 
 namespace User.Controllers;
 
@@ -730,6 +731,88 @@ public class UsersController : ControllerBase
         {
             return StatusCode(500, $"Error retrieving listening history: {ex.Message}");
         }
+    }
+
+    // Top Artists (current week)
+    [HttpGet("identity/{identityUserId}/top-artists/week/current")]
+    public async Task<ActionResult<object>> GetTopArtistsForCurrentWeek(string identityUserId)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        try
+        {
+            var filter = Builders<Models.User>.Filter.Eq(u => u.IdentityUserId, identityUserId);
+            var projection = Builders<Models.User>.Projection
+                .Include(u => u.TopArtistsWeekStart)
+                .Include(u => u.TopArtistsCurrentWeek)
+                .Include(u => u.ListeningHistory);
+
+            var user = await _context.Users.Find(filter).Project<Models.User>(projection).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                return NotFound("User not found");
+            }
+
+            var currentWeekStart = GetCurrentWeekStartUtc();
+            bool cacheValid = user.TopArtistsWeekStart.HasValue && user.TopArtistsWeekStart.Value == currentWeekStart && user.TopArtistsCurrentWeek != null && user.TopArtistsCurrentWeek.Count > 0;
+            // If cache is valid and at least one artist has count > 1, trust cache; else recompute
+            if (cacheValid && user.TopArtistsCurrentWeek.Any(a => a.Count > 1))
+            {
+                return Ok(user.TopArtistsCurrentWeek.OrderByDescending(a => a.Count).Take(3));
+            }
+
+            // Compute from listening history for current week
+            var weekItems = user.ListeningHistory
+                .Where(h => h.PlayedAt >= currentWeekStart)
+                .ToList();
+
+            // Count plays per individual artist (split by comma)
+            var dict = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var item in weekItems)
+            {
+                if (string.IsNullOrWhiteSpace(item.Artist)) continue;
+                var parts = item.Artist.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                foreach (var p in parts)
+                {
+                    var key = p.Trim();
+                    if (string.IsNullOrWhiteSpace(key)) continue;
+                    if (!dict.ContainsKey(key)) dict[key] = 0;
+                    dict[key]++;
+                }
+            }
+
+            var top = dict
+                .Select(kv => new TopArtist { Name = kv.Key, Count = kv.Value })
+                .OrderByDescending(t => t.Count)
+                .ThenBy(t => t.Name)
+                .Take(3)
+                .ToList();
+
+            // Save cache
+            var update = Builders<Models.User>.Update
+                .Set(u => u.TopArtistsWeekStart, currentWeekStart)
+                .Set(u => u.TopArtistsCurrentWeek, top);
+            await _context.Users.UpdateOneAsync(filter, update);
+
+            return Ok(top);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error computing top artists: {ex.Message}");
+        }
+    }
+
+    [NonAction]
+    private static DateTime GetCurrentWeekStartUtc()
+    {
+        // Week starts Sunday 00:00 UTC
+        var now = DateTime.UtcNow;
+        int diff = (int)now.DayOfWeek; // Sunday=0
+        var start = new DateTime(now.Year, now.Month, now.Day, 0, 0, 0, DateTimeKind.Utc).AddDays(-diff);
+        return start;
     }
 
 
