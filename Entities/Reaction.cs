@@ -17,6 +17,9 @@ public class Reaction : BaseEntity
 	[BsonElement("emoji")]
 	public string Emoji { get; set; } = string.Empty;
 
+	[BsonElement("postId")]
+	public string? PostId { get; set; }
+
 	// Optional context about what was reacted to
 	[BsonElement("contextType")]
 	public string? ContextType { get; set; } // e.g., recent_song | top_song | top_artist | common_artists

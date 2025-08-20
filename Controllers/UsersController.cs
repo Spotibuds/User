@@ -657,6 +657,59 @@ public class UsersController : ControllerBase
                 await _context.Users.UpdateOneAsync(filter, replaceUpdate);
             }
 
+            // Persist a recent_song feed item with stable key and trim to last N per user
+            if (_context.Feed != null)
+            {
+                var itemKey = $"recent:{identityUserId}:{dto.SongId}";
+                var feedItem = new User.Entities.FeedItem
+                {
+                    IdentityUserId = identityUserId,
+                    Type = "recent_song",
+                    SongId = dto.SongId,
+                    SongTitle = dto.SongTitle,
+                    Artist = dto.Artist,
+                    CoverUrl = dto.CoverUrl,
+                    PlayedAt = historyItem.PlayedAt,
+                    Key = itemKey,
+                    CreatedAt = DateTime.UtcNow
+                };
+
+                // Upsert by key+identity to avoid duplicates if repeated quickly
+                var upsertFilter = Builders<User.Entities.FeedItem>.Filter.And(
+                    Builders<User.Entities.FeedItem>.Filter.Eq(f => f.IdentityUserId, identityUserId),
+                    Builders<User.Entities.FeedItem>.Filter.Eq(f => f.Key, itemKey)
+                );
+                var updateDef = Builders<User.Entities.FeedItem>.Update
+                    .Set(f => f.IdentityUserId, feedItem.IdentityUserId)
+                    .Set(f => f.Type, feedItem.Type)
+                    .Set(f => f.SongId, feedItem.SongId)
+                    .Set(f => f.SongTitle, feedItem.SongTitle)
+                    .Set(f => f.Artist, feedItem.Artist)
+                    .Set(f => f.CoverUrl, feedItem.CoverUrl)
+                    .Set(f => f.PlayedAt, feedItem.PlayedAt)
+                    .Set(f => f.Key, feedItem.Key)
+                    .Set(f => f.CreatedAt, feedItem.CreatedAt);
+                await _context.Feed.UpdateOneAsync(upsertFilter, updateDef, new UpdateOptions { IsUpsert = true });
+
+                // Trim to last N recent_song items per user (configurable via env FEED_RECENT_MAX)
+                int maxRecent = 20;
+                var envMax = Environment.GetEnvironmentVariable("FEED_RECENT_MAX");
+                if (!string.IsNullOrEmpty(envMax) && int.TryParse(envMax, out var parsed) && parsed > 0 && parsed <= 200)
+                {
+                    maxRecent = parsed;
+                }
+                var recentItems = await _context.Feed
+                    .Find(f => f.IdentityUserId == identityUserId && f.Type == "recent_song")
+                    .SortByDescending(f => f.CreatedAt)
+                    .Skip(maxRecent)
+                    .ToListAsync();
+                if (recentItems.Count > 0)
+                {
+                    var idsToDelete = recentItems.Select(r => r.Id).ToList();
+                    await _context.Feed.DeleteManyAsync(f => idsToDelete.Contains(f.Id));
+                }
+            }
+
             return Ok(new { success = true, message = "Added to listening history" });
         }
         catch (Exception ex)

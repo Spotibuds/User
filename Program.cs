@@ -15,6 +15,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddMemoryCache();
 
 // JWT Configuration Configuration
 var jwtSecret = builder.Configuration["Jwt:Secret"];
@@ -256,6 +257,8 @@ builder.Services.AddScoped<MongoDbContext>(serviceProvider =>
 builder.Services.AddScoped<User.Services.IFriendNotificationService, User.Services.FriendNotificationService>();
 // Register weekly background job for Top Artists
 builder.Services.AddHostedService<User.Services.WeeklyTopArtistsService>();
+// Now Playing in-memory store
+builder.Services.AddSingleton<User.Services.INowPlayingStore, User.Services.NowPlayingStore>();
 
 // Register RabbitMQ service as optional - only if connection is available
 builder.Services.AddSingleton<User.Services.IRabbitMqService>(serviceProvider =>

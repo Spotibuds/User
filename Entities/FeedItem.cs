@@ -26,6 +26,9 @@ public class FeedItem : BaseEntity
 	[BsonElement("playedAt")]
 	public DateTime? PlayedAt { get; set; }
 
+	[BsonElement("key")]
+	public string? Key { get; set; } // stable de-dupe key per identityUserId+type+songId or payload
+
 	// For weekly top
 	[BsonElement("topArtists")]
 	public List<string>? TopArtists { get; set; }
@@ -39,9 +42,6 @@ public class FeedItem : BaseEntity
 
 	[BsonElement("commonArtists")]
 	public List<string>? CommonArtists { get; set; }
-
-	[BsonElement("createdAt")]
-	public new DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
 
 

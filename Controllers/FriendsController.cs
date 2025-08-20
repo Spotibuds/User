@@ -334,9 +334,13 @@ public class FriendsController : ControllerBase
             var friendIds = new List<string>();
             foreach (var friendship in friendships)
             {
-                var friendId = friendship.UserId == user.Id ? friendship.FriendId : friendship.UserId;
-                var friend = await _context.Users.Find(u => u.Id == friendId).FirstOrDefaultAsync();
-                friendIds.Add(friend?.IdentityUserId ?? friendId);
+                var friendMongoId = friendship.UserId == user.Id ? friendship.FriendId : friendship.UserId;
+                var friend = await _context.Users.Find(u => u.Id == friendMongoId).FirstOrDefaultAsync();
+                if (friend != null && !string.IsNullOrWhiteSpace(friend.IdentityUserId))
+                {
+                    friendIds.Add(friend.IdentityUserId);
+                }
+                // Skip orphaned friendships instead of returning a Mongo _id that the client cannot resolve
             }
 
             return Ok(friendIds);
