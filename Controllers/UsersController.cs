@@ -3,6 +3,7 @@ using MongoDB.Driver;
 using User.Data;
 using User.Models;
 using Microsoft.Extensions.Hosting;
+using User.Services;
 
 namespace User.Controllers;
 
@@ -11,10 +12,12 @@ namespace User.Controllers;
 public class UsersController : ControllerBase
 {
     private readonly MongoDbContext _context;
+    private readonly IAzureBlobService _azureBlobService;
 
-    public UsersController(MongoDbContext context)
+    public UsersController(MongoDbContext context, IAzureBlobService azureBlobService)
     {
         _context = context;
+        _azureBlobService = azureBlobService;
     }
 
     [HttpGet("health")]
@@ -542,6 +545,128 @@ public class UsersController : ControllerBase
         }
 
         return NoContent();
+    }
+
+    [HttpPost("{id}/profile-picture")]
+    public async Task<IActionResult> UploadProfilePicture(string id, IFormFile file)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        if (file == null || file.Length == 0)
+        {
+            return BadRequest("No file provided");
+        }
+
+        // Validate file type
+        var allowedTypes = new[] { "image/jpeg", "image/jpg", "image/png", "image/webp" };
+        if (!allowedTypes.Contains(file.ContentType.ToLower()))
+        {
+            return BadRequest("Only JPEG, PNG, and WebP images are allowed");
+        }
+
+        // Validate file size (max 5MB)
+        if (file.Length > 5 * 1024 * 1024)
+        {
+            return BadRequest("File size cannot exceed 5MB");
+        }
+
+        try
+        {
+            // Check if user exists
+            var user = await _context.Users.Find(u => u.Id == id).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                return NotFound("User not found");
+            }
+
+            // Upload to Azure Blob Storage
+            using var stream = file.OpenReadStream();
+            var profilePictureUrl = await _azureBlobService.UploadUserProfilePictureAsync(id, stream, file.FileName);
+
+            // Update user's avatar URL in database
+            var updateDefinition = Builders<Models.User>.Update
+                .Set(u => u.AvatarUrl, profilePictureUrl)
+                .Set(u => u.UpdatedAt, DateTime.UtcNow);
+
+            var result = await _context.Users.UpdateOneAsync(
+                u => u.Id == id,
+                updateDefinition);
+
+            if (result.MatchedCount == 0)
+            {
+                return NotFound("User not found");
+            }
+
+            return Ok(new { avatarUrl = profilePictureUrl });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error uploading profile picture: {ex.Message}");
+        }
+    }
+
+    [HttpPost("identity/{identityUserId}/profile-picture")]
+    public async Task<IActionResult> UploadProfilePictureByIdentityId(string identityUserId, IFormFile file)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
+
+        if (file == null || file.Length == 0)
+        {
+            return BadRequest("No file provided");
+        }
+
+        // Validate file type
+        var allowedTypes = new[] { "image/jpeg", "image/jpg", "image/png", "image/webp" };
+        if (!allowedTypes.Contains(file.ContentType.ToLower()))
+        {
+            return BadRequest("Only JPEG, PNG, and WebP images are allowed");
+        }
+
+        // Validate file size (max 5MB)
+        if (file.Length > 5 * 1024 * 1024)
+        {
+            return BadRequest("File size cannot exceed 5MB");
+        }
+
+        try
+        {
+            // Find user by identity user ID
+            var user = await _context.Users.Find(u => u.IdentityUserId == identityUserId).FirstOrDefaultAsync();
+            if (user == null)
+            {
+                return NotFound("User not found");
+            }
+
+            // Upload to Azure Blob Storage using the user's MongoDB ID
+            using var stream = file.OpenReadStream();
+            var profilePictureUrl = await _azureBlobService.UploadUserProfilePictureAsync(user.Id, stream, file.FileName);
+
+            // Update user's avatar URL in database
+            var updateDefinition = Builders<Models.User>.Update
+                .Set(u => u.AvatarUrl, profilePictureUrl)
+                .Set(u => u.UpdatedAt, DateTime.UtcNow);
+
+            var result = await _context.Users.UpdateOneAsync(
+                u => u.IdentityUserId == identityUserId,
+                updateDefinition);
+
+            if (result.MatchedCount == 0)
+            {
+                return NotFound("User not found");
+            }
+
+            return Ok(new { avatarUrl = profilePictureUrl });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, $"Error uploading profile picture: {ex.Message}");
+        }
     }
 
     [HttpDelete("{id}")]

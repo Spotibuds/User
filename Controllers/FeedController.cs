@@ -24,8 +24,11 @@ public class FeedController : ControllerBase
 	[HttpGet("slides")]
 	public async Task<ActionResult<object>> GetSlides([FromQuery] string identityUserId, [FromQuery] int limit = 20, [FromQuery] int skip = 0)
 	{
+		Console.WriteLine($"[Feed API] GetSlides called with identityUserId: {identityUserId}, limit: {limit}, skip: {skip}");
+		
 		if (!_context.IsConnected || _context.Users == null)
 		{
+			Console.WriteLine("[Feed API] Database connection failed");
 			return StatusCode(503, "Service unavailable - database connection failed");
 		}
 
@@ -38,8 +41,11 @@ public class FeedController : ControllerBase
 
 			if (currentUser == null)
 			{
+				Console.WriteLine($"[Feed API] User not found for identityUserId: {identityUserId}");
 				return NotFound("User not found");
 			}
+			
+			Console.WriteLine($"[Feed API] Found current user: {currentUser.UserName}");
 
 			// Get other users who are not private and not the current user
 			var otherUsers = await _context.Users
@@ -53,8 +59,11 @@ public class FeedController : ControllerBase
 				)
 				.ToListAsync();
 
+			Console.WriteLine($"[Feed API] Found {otherUsers.Count} other users");
+
 			if (!otherUsers.Any())
 			{
+				Console.WriteLine("[Feed API] No other users found, returning empty list");
 				return Ok(new List<object>());
 			}
 
@@ -227,6 +236,7 @@ public class FeedController : ControllerBase
 
 			// Shuffle the slides and paginate
 			slides = slides.OrderBy(_ => rng.Next()).Skip(skip).Take(limit).ToList();
+			Console.WriteLine($"[Feed API] Returning {slides.Count} slides after shuffle and pagination");
 			return Ok(slides);
 		}
 		catch (Exception ex)
@@ -311,8 +321,26 @@ public class FeedController : ControllerBase
 					request.PostId = $"common:{request.FromIdentityUserId}:{request.ToIdentityUserId}:{WeekKey()}";
 				}
 			}
-			await _context.Reactions!.InsertOneAsync(request);
-			return Ok(new { success = true, message = "Reaction sent" });
+
+			// Check if reaction already exists (for toggle behavior)
+			var existingReaction = await _context.Reactions!
+				.Find(r => r.PostId == request.PostId && 
+						  r.FromIdentityUserId == request.FromIdentityUserId && 
+						  r.Emoji == request.Emoji)
+				.FirstOrDefaultAsync();
+
+			if (existingReaction != null)
+			{
+				// Remove existing reaction (toggle off)
+				await _context.Reactions!.DeleteOneAsync(r => r.Id == existingReaction.Id);
+				return Ok(new { success = true, message = "Reaction removed", action = "removed" });
+			}
+			else
+			{
+				// Add new reaction (toggle on)
+				await _context.Reactions!.InsertOneAsync(request);
+				return Ok(new { success = true, message = "Reaction sent", action = "added" });
+			}
 		}
 		catch (Exception ex)
 		{
@@ -344,7 +372,7 @@ public class FeedController : ControllerBase
 	}
 
 	[HttpGet("reactions/by-post")]
-	public async Task<ActionResult<IEnumerable<Reaction>>> GetReactionsByPost([FromQuery] string postId)
+	public async Task<ActionResult<IEnumerable<Reaction>>> GetReactionsByPost([FromQuery] string postId, [FromQuery] string? currentUserId = null)
 	{
 		if (!_context.IsConnected)
 		{
@@ -356,6 +384,47 @@ public class FeedController : ControllerBase
 				.Find(r => r.PostId == postId)
 				.SortByDescending(r => r.CreatedAt)
 				.ToListAsync();
+
+			// If currentUserId is provided, filter reactions to show only those from friends
+			if (!string.IsNullOrEmpty(currentUserId))
+			{
+				// Get current user
+				var currentUser = await _context.Users
+					.Find(u => u.IdentityUserId == currentUserId)
+					.FirstOrDefaultAsync();
+
+				if (currentUser != null)
+				{
+					// Get friends of the current user
+					var friendships = await _context.Friends!
+						.Find(f => (f.UserId == currentUser.Id || f.FriendId == currentUser.Id) && f.Status == FriendStatus.Accepted)
+						.ToListAsync();
+
+					var friendIds = new HashSet<string>();
+					foreach (var friendship in friendships)
+					{
+						if (friendship.UserId == currentUser.Id)
+						{
+							// Get the friend's identity user ID
+							var friend = await _context.Users.Find(u => u.Id == friendship.FriendId).FirstOrDefaultAsync();
+							if (friend != null) friendIds.Add(friend.IdentityUserId);
+						}
+						else
+						{
+							// Get the user's identity user ID  
+							var friend = await _context.Users.Find(u => u.Id == friendship.UserId).FirstOrDefaultAsync();
+							if (friend != null) friendIds.Add(friend.IdentityUserId);
+						}
+					}
+
+					// Also include the current user's own reactions
+					friendIds.Add(currentUserId);
+
+					// Filter reactions to only include those from friends (and self)
+					reactions = reactions.Where(r => friendIds.Contains(r.FromIdentityUserId)).ToList();
+				}
+			}
+
 			return Ok(reactions);
 		}
 		catch (Exception ex)

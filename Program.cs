@@ -255,6 +255,8 @@ builder.Services.AddScoped<MongoDbContext>(serviceProvider =>
     options.PayloadSerializerOptions.ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.Preserve;
 });// Register services
 builder.Services.AddScoped<User.Services.IFriendNotificationService, User.Services.FriendNotificationService>();
+// Register Azure Blob Service for user profile pictures
+builder.Services.AddScoped<User.Services.IAzureBlobService, User.Services.AzureBlobService>();
 // Register weekly background job for Top Artists
 builder.Services.AddHostedService<User.Services.WeeklyTopArtistsService>();
 // Now Playing in-memory store

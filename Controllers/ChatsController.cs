@@ -241,6 +241,9 @@ public class ChatsController : ControllerBase
             return StatusCode(503, "Service unavailable - database connection failed");
         }
 
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        Console.WriteLine($"GetUserChats: Starting request for userId: {userId}");
+
         try
         {
             // Convert IdentityUserId to MongoDB _id
@@ -258,20 +261,35 @@ public class ChatsController : ControllerBase
                 .SortByDescending(c => c.LastActivity)
                 .ToListAsync();
 
+            if (chats.Count == 0)
+            {
+                return Ok(new List<object>());
+            }
+
+            // Get all unique participant IDs from all chats
+            var allParticipantIds = chats
+                .SelectMany(c => c.Participants)
+                .Distinct()
+                .ToList();
+
+            // Batch query to get all participants at once
+            var allParticipants = await _context.Users
+                .Find(u => allParticipantIds.Contains(u.Id))
+                .ToListAsync();
+
+            // Create a lookup dictionary for fast access
+            var participantLookup = allParticipants.ToDictionary(u => u.Id, u => u.IdentityUserId);
+
             var chatList = new List<object>();
             foreach (var chat in chats)
             {
-                // Convert MongoDB _id back to IdentityUserId for participants
+                // Convert MongoDB _id back to IdentityUserId for participants using lookup
                 var participantIdentityIds = new List<string>();
                 foreach (var participantId in chat.Participants)
                 {
-                    var participant = await _context.Users
-                        .Find(u => u.Id == participantId)
-                        .FirstOrDefaultAsync();
-                    
-                    if (participant != null)
+                    if (participantLookup.TryGetValue(participantId, out var identityUserId))
                     {
-                        participantIdentityIds.Add(participant.IdentityUserId);
+                        participantIdentityIds.Add(identityUserId);
                     }
                     else
                     {
@@ -291,14 +309,20 @@ public class ChatsController : ControllerBase
                 });
             }
 
+            stopwatch.Stop();
+            Console.WriteLine($"GetUserChats: Completed successfully in {stopwatch.ElapsedMilliseconds}ms, returned {chatList.Count} chats");
             return Ok(chatList);
         }
         catch (MongoDB.Driver.MongoConnectionException ex)
         {
+            stopwatch.Stop();
+            Console.WriteLine($"GetUserChats: MongoDB connection error after {stopwatch.ElapsedMilliseconds}ms: {ex.Message}");
             return StatusCode(503, new { message = "Database temporarily unavailable", error = ex.Message });
         }
         catch (Exception ex)
         {
+            stopwatch.Stop();
+            Console.WriteLine($"GetUserChats: Unexpected error after {stopwatch.ElapsedMilliseconds}ms: {ex.Message}");
             return StatusCode(500, new { message = "Internal server error", error = ex.Message });
         }
     }

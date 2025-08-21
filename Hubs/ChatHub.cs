@@ -95,9 +95,20 @@ public async Task JoinChat(string chatId)
             return;
         }
 
-        // Verify user has access to this chat
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == userId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            await Clients.Caller.SendAsync("Error", "User not found in database");
+            return;
+        }
+
+        // Verify user has access to this chat using MongoDB _id
         var chat = await _context.Chats
-            .Find(c => c.Id == chatId && c.Participants.Contains(userId))
+            .Find(c => c.Id == chatId && c.Participants.Contains(user.Id))
             .FirstOrDefaultAsync();
 
         if (chat == null)
@@ -106,11 +117,11 @@ public async Task JoinChat(string chatId)
             return;
         }
 
-        // Create message
+        // Create message with MongoDB _id
         var message = new Message
         {
             ChatId = chatId,
-            SenderId = userId,
+            SenderId = user.Id, // Use MongoDB _id
             Content = content,
             Type = MessageType.Text
         };
@@ -126,29 +137,25 @@ public async Task JoinChat(string chatId)
         await _context.Chats.UpdateOneAsync(c => c.Id == chatId, updateDefinition);
 
         // Update friendship's last activity time
-        var participants = chat.Participants.Where(p => p != userId).ToList();
+        var participants = chat.Participants.Where(p => p != user.Id).ToList();
         foreach (var participantId in participants)
         {
             var friendshipUpdate = Builders<Friend>.Update
                 .Set(f => f.CreatedAt, DateTime.UtcNow);
 
             await _context.Friends.UpdateManyAsync(
-                f => (f.UserId == userId && f.FriendId == participantId) ||
-                     (f.UserId == participantId && f.FriendId == userId),
+                f => (f.UserId == user.Id && f.FriendId == participantId) ||
+                     (f.UserId == participantId && f.FriendId == user.Id),
                 friendshipUpdate);
         }
 
-        // Get sender info
-        var sender = await _context.Users
-            .Find(u => u.IdentityUserId == userId)
-            .FirstOrDefaultAsync();
-
+        // Get sender info for response (convert back to IdentityUserId)
         var messageDto = new
         {
             Id = message.Id,
             ChatId = chatId,
-            SenderId = userId,
-            SenderUsername = sender?.UserName ?? "Unknown",
+            SenderId = userId, // Use IdentityUserId for frontend
+            SenderUsername = user.UserName ?? "Unknown",
             Content = content,
             Type = message.Type.ToString(),
             CreatedAt = message.CreatedAt,
@@ -170,6 +177,17 @@ public async Task JoinChat(string chatId)
             return;
         }
 
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == userId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            await Clients.Caller.SendAsync("Error", "User not found in database");
+            return;
+        }
+
         var message = await _context.Messages
             .Find(m => m.Id == messageId)
             .FirstOrDefaultAsync();
@@ -180,9 +198,9 @@ public async Task JoinChat(string chatId)
             return;
         }
 
-        // Check if user has access to this message (through chat participation)
+        // Check if user has access to this message (through chat participation) using MongoDB _id
         var chat = await _context.Chats
-            .Find(c => c.Id == message.ChatId && c.Participants.Contains(userId))
+            .Find(c => c.Id == message.ChatId && c.Participants.Contains(user.Id))
             .FirstOrDefaultAsync();
 
         if (chat == null)
@@ -191,12 +209,12 @@ public async Task JoinChat(string chatId)
             return;
         }
 
-        // Add read receipt if not already read by this user
-        if (!message.ReadBy.Any(r => r.UserId == userId))
+        // Add read receipt if not already read by this user (use MongoDB _id for storage)
+        if (!message.ReadBy.Any(r => r.UserId == user.Id))
         {
             var readReceipt = new MessageRead
             {
-                UserId = userId,
+                UserId = user.Id, // Use MongoDB _id
                 ReadAt = DateTime.UtcNow
             };
 
@@ -205,11 +223,11 @@ public async Task JoinChat(string chatId)
 
             await _context.Messages.UpdateOneAsync(m => m.Id == messageId, updateDefinition);
 
-            // Notify other participants that message was read
+            // Notify other participants that message was read (use IdentityUserId for frontend)
             await Clients.Group($"chat_{message.ChatId}").SendAsync("MessageRead", new
             {
                 MessageId = messageId,
-                UserId = userId,
+                UserId = userId, // Use IdentityUserId for frontend compatibility
                 ReadAt = readReceipt.ReadAt
             });
         }
