@@ -305,6 +305,7 @@ public class ChatsController : ControllerBase
                     name = chat.Name,
                     participants = participantIdentityIds,
                     lastActivity = chat.LastActivity,
+                    lastMessageId = chat.LastMessageId,
                     createdAt = chat.CreatedAt
                 });
             }
