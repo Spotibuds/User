@@ -369,15 +369,101 @@ public class UsersController : ControllerBase
         }
     }
 
+    [HttpPost("batch")]
+    public async Task<ActionResult<IEnumerable<UserDto>>> GetUsersBatch([FromBody] BatchUserRequest request)
+    {
+        if (!_context.IsConnected || _context.Users == null)
+        {
+            return StatusCode(503, "Service unavailable - database connection failed");
+        }
 
+        if (request.UserIds == null || !request.UserIds.Any())
+        {
+            return Ok(new List<UserDto>());
+        }
 
+        try
+        {
+            // Limit batch size to prevent abuse
+            var userIds = request.UserIds.Take(50).ToList();
+            
+            Console.WriteLine($"[BatchUser] Searching for {userIds.Count} users: {string.Join(", ", userIds)}");
 
+            // Separate GUIDs (IdentityUserIds) from ObjectIds (MongoDB Ids)
+            var guids = new List<string>();
+            var objectIds = new List<string>();
+            
+            foreach (var id in userIds)
+            {
+                if (string.IsNullOrEmpty(id)) continue;
+                
+                // Check if it's a valid MongoDB ObjectId (24 hex chars)
+                if (id.Length == 24 && System.Text.RegularExpressions.Regex.IsMatch(id, @"^[0-9a-fA-F]{24}$"))
+                {
+                    objectIds.Add(id);
+                }
+                else
+                {
+                    // Assume it's a GUID (IdentityUserId)
+                    guids.Add(id);
+                }
+            }
 
+            var users = new List<Models.User>();
 
+            // Query by IdentityUserId (GUIDs)
+            if (guids.Any())
+            {
+                var usersByIdentityId = await _context.Users
+                    .Find(u => guids.Contains(u.IdentityUserId))
+                    .ToListAsync();
+                users.AddRange(usersByIdentityId);
+            }
 
+            // Query by MongoDB ObjectId
+            if (objectIds.Any())
+            {
+                var usersByObjectId = await _context.Users
+                    .Find(u => objectIds.Contains(u.Id))
+                    .ToListAsync();
+                users.AddRange(usersByObjectId);
+            }
+            
+            Console.WriteLine($"[BatchUser] Found {users.Count} users in database");
 
+            var userDtos = users.Select(user => new UserDto
+            {
+                Id = user.Id,
+                IdentityUserId = user.IdentityUserId,
+                UserName = user.UserName,
+                DisplayName = user.DisplayName,
+                Bio = user.Bio,
+                AvatarUrl = user.AvatarUrl,
+                Playlists = user.Playlists?.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList() ?? new List<PlaylistReferenceDto>(),
+                FollowedUsers = user.FollowedUsers?.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList() ?? new List<UserReferenceDto>(),
+                Followers = user.Followers?.Select(f => new UserReferenceDto { Id = f.Id }).ToList() ?? new List<UserReferenceDto>(),
+                IsPrivate = user.IsPrivate,
+                CreatedAt = user.CreatedAt
+            }).ToList();
 
+            return Ok(userDtos);
+        }
+        catch (MongoDB.Driver.MongoConnectionException ex)
+        {
+            Console.WriteLine($"[BatchUser] MongoDB connection error: {ex.Message}");
+            return StatusCode(503, "Database connection failed. Please try again later.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[BatchUser] Internal server error: {ex.Message}\n{ex.StackTrace}");
+            return StatusCode(500, $"Internal server error: {ex.Message}");
+        }
+    }
 
+    public class BatchUserRequest
+    {
+        public List<string> UserIds { get; set; } = new();
+    }
 
     [HttpGet("search")]
     public async Task<ActionResult<List<UserDto>>> SearchUsers(string q = "", int page = 1, int pageSize = 20)

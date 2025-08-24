@@ -260,6 +260,25 @@ public class FeedController : ControllerBase
 		}
 	}
 
+	[HttpDelete("nowplaying/{identityUserId}")]
+	public ActionResult<object> ClearNowPlaying(string identityUserId)
+	{
+		try
+		{
+			if (string.IsNullOrWhiteSpace(identityUserId))
+			{
+				return BadRequest("Identity user ID is required");
+			}
+
+			_nowPlaying.Clear(identityUserId);
+			return Ok(new { success = true });
+		}
+		catch (Exception ex)
+		{
+			return StatusCode(500, $"Error clearing now playing: {ex.Message}");
+		}
+	}
+
 	public class NowPlayingQuery
 	{
 		public List<string> UserIds { get; set; } = new();

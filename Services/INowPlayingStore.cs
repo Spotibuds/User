@@ -19,6 +19,7 @@ public interface INowPlayingStore
 	void Set(NowPlayingState state, TimeSpan ttl);
 	NowPlayingState? Get(string identityUserId);
 	IEnumerable<NowPlayingState> GetMany(IEnumerable<string> identityUserIds);
+	void Clear(string identityUserId);
 }
 
 public class NowPlayingStore : INowPlayingStore
@@ -55,6 +56,12 @@ public class NowPlayingStore : INowPlayingStore
 			var s = Get(id);
 			if (s != null) yield return s;
 		}
+	}
+
+	public void Clear(string identityUserId)
+	{
+		if (string.IsNullOrWhiteSpace(identityUserId)) return;
+		_cache.Remove(KeyOf(identityUserId));
 	}
 }
 
