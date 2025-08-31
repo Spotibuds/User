@@ -12,6 +12,7 @@ public interface IAzureBlobService
     Task<List<string>> ListFilesAsync(string containerName, string prefix = "");
     BlobContainerClient GetBlobContainerClient(string containerName);
     string GenerateSasUrl(string containerName, string blobName, TimeSpan? expiry = null);
+    Task UpdateContainerAccessLevelAsync(string containerName);
 }
 
 public class AzureBlobService : IAzureBlobService
@@ -84,26 +85,63 @@ public class AzureBlobService : IAzureBlobService
 
     public string GenerateSasUrl(string containerName, string blobName, TimeSpan? expiry = null)
     {
-        var containerClient = _blobServiceClient.GetBlobContainerClient(containerName);
-        var blobClient = containerClient.GetBlobClient(blobName);
-
-        // Check if we can generate SAS (requires account key)
-        if (!blobClient.CanGenerateSasUri)
+        try
         {
-            // Fallback to direct URL (won't work with private containers)
-            return blobClient.Uri.ToString();
+            var containerClient = _blobServiceClient.GetBlobContainerClient(containerName);
+            var blobClient = containerClient.GetBlobClient(blobName);
+
+            // Check if we can generate SAS (requires account key)
+            if (!blobClient.CanGenerateSasUri)
+            {
+                Console.WriteLine($"ERROR: Cannot generate SAS URI for {containerName}/{blobName}. The connection string may not include the account key.");
+                Console.WriteLine($"Connection string format needed: DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net");
+                throw new InvalidOperationException($"Cannot generate SAS URI. This usually means the connection string doesn't include the account key, or managed identity is being used without proper SAS delegation.");
+            }
+
+            var sasBuilder = new BlobSasBuilder
+            {
+                BlobContainerName = containerName,
+                BlobName = blobName,
+                Resource = "b", // blob resource
+                ExpiresOn = DateTimeOffset.UtcNow.Add(expiry ?? TimeSpan.FromDays(365)) // Long-lived for media files
+            };
+
+            sasBuilder.SetPermissions(BlobSasPermissions.Read);
+
+            var sasUrl = blobClient.GenerateSasUri(sasBuilder).ToString();
+            Console.WriteLine($"Generated SAS URL for {containerName}/{blobName}");
+            return sasUrl;
         }
-
-        var sasBuilder = new BlobSasBuilder
+        catch (Exception ex)
         {
-            BlobContainerName = containerName,
-            BlobName = blobName,
-            Resource = "b", // blob resource
-            ExpiresOn = DateTimeOffset.UtcNow.Add(expiry ?? TimeSpan.FromHours(1)) // Default 1 hour expiry
-        };
+            Console.WriteLine($"Error generating SAS URL for {containerName}/{blobName}: {ex.Message}");
+            throw; // Re-throw the exception since we can't fallback to direct URLs with private containers
+        }
+    }
 
-        sasBuilder.SetPermissions(BlobSasPermissions.Read);
+    public async Task UpdateContainerAccessLevelAsync(string containerName)
+    {
+        try
+        {
+            var containerClient = _blobServiceClient.GetBlobContainerClient(containerName);
+            
+            // Check if container exists
+            var exists = await containerClient.ExistsAsync();
+            if (!exists.Value)
+            {
+                Console.WriteLine($"Container {containerName} does not exist, creating with public blob access");
+                await containerClient.CreateIfNotExistsAsync(PublicAccessType.Blob);
+                return;
+            }
 
-        return blobClient.GenerateSasUri(sasBuilder).ToString();
+            // Update existing container to allow public blob access
+            await containerClient.SetAccessPolicyAsync(PublicAccessType.Blob);
+            Console.WriteLine($"Updated container {containerName} to allow public blob access");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error updating container access level for {containerName}: {ex.Message}");
+            throw;
+        }
     }
 }
