@@ -39,4 +39,5 @@ public class MongoDbContext
     public IMongoCollection<Message>? Messages => _database?.GetCollection<Message>("messages");
     public IMongoCollection<User.Entities.Reaction>? Reactions => _database?.GetCollection<User.Entities.Reaction>("reactions");
     public IMongoCollection<User.Entities.FeedItem>? Feed => _database?.GetCollection<User.Entities.FeedItem>("feed");
+    public IMongoCollection<Notification>? Notifications => _database?.GetCollection<Notification>("notifications");
 } 

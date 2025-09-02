@@ -13,11 +13,15 @@ public class FriendsController : ControllerBase
 {
     private readonly MongoDbContext _context;
     private readonly IFriendNotificationService _notificationService;
+    private readonly INotificationService _persistentNotificationService;
+    private readonly ILogger<FriendsController> _logger;
 
-    public FriendsController(MongoDbContext context, IFriendNotificationService notificationService)
+    public FriendsController(MongoDbContext context, IFriendNotificationService notificationService, INotificationService persistentNotificationService, ILogger<FriendsController> logger)
     {
         _context = context;
         _notificationService = notificationService;
+        _persistentNotificationService = persistentNotificationService;
+        _logger = logger;
     }
 
     /// <summary>
@@ -53,13 +57,20 @@ public class FriendsController : ControllerBase
             return StatusCode(503, new { message = "Database temporarily unavailable" });
         }
 
+        // Get requester ID from JWT token
+        var requesterId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(requesterId))
+        {
+            return Unauthorized("User ID not found in token");
+        }
+
         // Validate that both users exist
         var requester = await _context.Users
-            .Find(u => u.IdentityUserId == dto.UserId)
+            .Find(u => u.IdentityUserId == requesterId)
             .FirstOrDefaultAsync();
 
         var target = await _context.Users
-            .Find(u => u.IdentityUserId == dto.TargetUserId)
+            .Find(u => u.IdentityUserId == dto.ToUserId)
             .FirstOrDefaultAsync();
 
         if (requester == null || target == null)
@@ -100,11 +111,15 @@ public class FriendsController : ControllerBase
 
         await _context.Friends.InsertOneAsync(friendship);
 
-        // Send real-time notification
+        // Note: Using only real-time notifications for friend requests to prevent duplicates
+        // The frontend will receive these instantly via SignalR
+
+        // Send real-time notification via SignalR for instant delivery
         await _notificationService.NotifyFriendRequestSent(
             requester.IdentityUserId, 
             target.IdentityUserId, 
-            requester.UserName
+            requester.UserName ?? "Unknown User",
+            friendship.Id  // Pass the friendship ID
         );
 
         return Ok(new { 
@@ -167,13 +182,23 @@ public class FriendsController : ControllerBase
                 .Set(f => f.Status, Entities.FriendStatus.Accepted)
                 .Set(f => f.AcceptedAt, DateTime.UtcNow));
 
-        // Send real-time notification
+        // Send real-time notification to the requester (person who sent the request)
         var requester = await _context.Users.Find(u => u.Id == friendship.UserId).FirstOrDefaultAsync();
         await _notificationService.NotifyFriendRequestAccepted(
             requester?.IdentityUserId ?? friendship.UserId,
             user.IdentityUserId,
             user.UserName
         );
+
+        // Send real-time notification to the accepter (person who accepted the request) so their friends list updates
+        if (requester != null)
+        {
+            await _notificationService.NotifyFriendAdded(
+                user.IdentityUserId,
+                requester.IdentityUserId,
+                requester.UserName
+            );
+        }
 
         return Ok(new
         {
@@ -235,13 +260,18 @@ public class FriendsController : ControllerBase
             Builders<Entities.Friend>.Update
                 .Set(f => f.Status, Entities.FriendStatus.Declined));
 
-        // Send real-time notification
+        // Send real-time notification only (no persistent notification to avoid duplicates)
         var requester = await _context.Users.Find(u => u.Id == friendship.UserId).FirstOrDefaultAsync();
+        
+        _logger.LogInformation($"🔍 DEBUGGING: About to send decline notification to requester {requester?.IdentityUserId} from {user.UserName}");
+        
         await _notificationService.NotifyFriendRequestDeclined(
             requester?.IdentityUserId ?? friendship.UserId,
             user.IdentityUserId,
             user.UserName
         );
+        
+        _logger.LogInformation($"✅ DEBUGGING: Decline notification sent successfully");
 
         return Ok(new
         {
@@ -445,13 +475,33 @@ public class FriendsController : ControllerBase
         // Delete the friendship
         await _context.Friends.DeleteOneAsync(f => f.Id == friendshipId);
 
-        // Send real-time notification
-        var otherUser = await _context.Users.Find(u => u.Id == (friendship.UserId == user.Id ? friendship.FriendId : friendship.UserId)).FirstOrDefaultAsync();
-        await _notificationService.NotifyFriendRemoved(
-            otherUser?.IdentityUserId ?? friendship.UserId,
-            user.IdentityUserId,
-            user.UserName
-        );
+        // Determine the other user ID (the one being removed from)
+        string otherUserId = friendship.UserId == user.Id ? friendship.FriendId : friendship.UserId;
+        var otherUser = await _context.Users.Find(u => u.Id == otherUserId).FirstOrDefaultAsync();
+        
+        if (otherUser != null)
+        {
+            _logger.LogDebug($"Sending friend removed notification: {user.UserName} (remover) -> {otherUser.UserName} (recipient)");
+            
+            // Send real-time notification to the other user (the one who was removed)
+            // Parameters: userId (remover), friendId (recipient), removerUsername
+            await _notificationService.NotifyFriendRemoved(
+                user.IdentityUserId,        // userId = the remover (source of the notification)
+                otherUser.IdentityUserId,   // friendId = the recipient (person who was removed)
+                user.UserName               // removerUsername = name of the person who did the removing
+            );
+
+            // Also notify the remover that they successfully removed the friend
+            await _notificationService.NotifyFriendRemovedByYou(
+                user.IdentityUserId,        // The person who did the removing
+                otherUser.IdentityUserId,   // ID of the person who was removed
+                otherUser.UserName          // Name of the person who was removed
+            );
+        }
+        else
+        {
+            _logger.LogWarning($"Could not find other user with ID {otherUserId} for friend removal notification");
+        }
 
         return Ok(new { message = "Friend removed successfully" });
     }
@@ -460,8 +510,7 @@ public class FriendsController : ControllerBase
 // DTOs
 public class SendFriendRequestDto
 {
-    public string UserId { get; set; } = string.Empty;
-    public string TargetUserId { get; set; } = string.Empty;
+    public string ToUserId { get; set; } = string.Empty;
 }
 
 public class AcceptFriendRequestDto

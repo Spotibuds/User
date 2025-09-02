@@ -54,8 +54,23 @@ public class RabbitMqService : IRabbitMqService, IDisposable
 
         try
         {
+            // Declare durable exchange for friend events
+            _channel.ExchangeDeclare("spotibuds.friends", ExchangeType.Topic, durable: true);
+            
             var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
-            _channel.BasicPublish(exchange: "", routingKey: routingKey, basicProperties: null, body: body);
+            var properties = _channel.CreateBasicProperties();
+            properties.Persistent = true; // Make message persistent
+            properties.MessageId = Guid.NewGuid().ToString();
+            properties.Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            
+            _channel.BasicPublish(
+                exchange: "spotibuds.friends",
+                routingKey: routingKey,
+                basicProperties: properties,
+                body: body
+            );
+            
+            Console.WriteLine($"Published message with routing key: {routingKey}");
             await Task.CompletedTask;
         }
         catch (Exception ex)

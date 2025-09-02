@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.SignalR;
 using User.Data;
 using User.Hubs;
+using User.Services;
 using MongoDB.Driver;
 using MongoDB.Bson;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -253,22 +254,16 @@ builder.Services.AddScoped<MongoDbContext>(serviceProvider =>
     options.PayloadSerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
     // Preserve references to handle circular references
     options.PayloadSerializerOptions.ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.Preserve;
-});// Register services
-builder.Services.AddScoped<User.Services.IFriendNotificationService, User.Services.FriendNotificationService>();
-// Register Azure Blob Service for user profile pictures
-builder.Services.AddScoped<User.Services.IAzureBlobService, User.Services.AzureBlobService>();
-// Register weekly background job for Top Artists
-builder.Services.AddHostedService<User.Services.WeeklyTopArtistsService>();
-// Now Playing in-memory store
-builder.Services.AddSingleton<User.Services.INowPlayingStore, User.Services.NowPlayingStore>();
+});
 
-// Register RabbitMQ service as optional - only if connection is available
-builder.Services.AddSingleton<User.Services.IRabbitMqService>(serviceProvider =>
+// Register services
+// Register RabbitMQ service first as it's a dependency for other services
+builder.Services.AddSingleton<IRabbitMqService>(serviceProvider =>
 {
     try
     {
         var configuration = serviceProvider.GetRequiredService<IConfiguration>();
-        var rabbitMqService = new User.Services.RabbitMqService(configuration);
+        var rabbitMqService = new RabbitMqService(configuration);
         return rabbitMqService;
     }
     catch (Exception ex)
@@ -279,6 +274,21 @@ builder.Services.AddSingleton<User.Services.IRabbitMqService>(serviceProvider =>
         return null;
     }
 });
+
+// Register services
+// Register Azure Blob Service for user profile pictures
+builder.Services.AddScoped<IAzureBlobService, AzureBlobService>();
+// Register notification services
+builder.Services.AddScoped<INotificationService, NotificationService>();
+builder.Services.AddScoped<IRabbitMqEventService, RabbitMqEventService>();
+// Now register FriendNotificationService after its dependencies
+builder.Services.AddScoped<IFriendNotificationService, FriendNotificationServiceSimple>();
+// Register weekly background job for Top Artists
+builder.Services.AddHostedService<WeeklyTopArtistsService>();
+// Register RabbitMQ consumer service
+builder.Services.AddHostedService<RabbitMqConsumerService>();
+// Now Playing in-memory store
+builder.Services.AddSingleton<INowPlayingStore, NowPlayingStore>();
 
 // CORS Configuration
 var corsSection = builder.Configuration.GetSection("Cors");
@@ -381,6 +391,18 @@ app.MapHub<FriendHub>("/friend-hub", options =>
     options.WebSockets.CloseTimeout = TimeSpan.FromSeconds(30);
     
     // Accept any WebSocket subprotocol offered by the client
+    options.WebSockets.SubProtocolSelector = protocolList => 
+        (protocolList != null && protocolList.Count > 0) ? protocolList[0] : null;
+});
+
+app.MapHub<NotificationHub>("/notification-hub", options =>
+{
+    options.CloseOnAuthenticationExpiration = false;
+    options.Transports = Microsoft.AspNetCore.Http.Connections.HttpTransportType.WebSockets | 
+                        Microsoft.AspNetCore.Http.Connections.HttpTransportType.ServerSentEvents |
+                        Microsoft.AspNetCore.Http.Connections.HttpTransportType.LongPolling;
+    options.LongPolling.PollTimeout = TimeSpan.FromSeconds(90);
+    options.WebSockets.CloseTimeout = TimeSpan.FromSeconds(30);
     options.WebSockets.SubProtocolSelector = protocolList => 
         (protocolList != null && protocolList.Count > 0) ? protocolList[0] : null;
 });

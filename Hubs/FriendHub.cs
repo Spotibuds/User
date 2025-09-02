@@ -265,63 +265,10 @@ public class FriendHub : Hub
 
     public async Task DeclineFriendRequest(string requestId)
     {
-        try
-        {
-            var userId = GetUserIdFromContext();
-            if (string.IsNullOrEmpty(userId))
-            {
-                await Clients.Caller.SendAsync("Error", "Unauthorized");
-                return;
-            }
-
-            // Convert IdentityUserId to MongoDB _id for database queries
-            var user = await _context.Users.Find(u => u.IdentityUserId == userId).FirstOrDefaultAsync();
-            if (user == null)
-            {
-                await Clients.Caller.SendAsync("Error", "User not found");
-                return;
-            }
-
-            var userMongoId = user.Id;
-
-            var friendRequest = await _context.Friends.Find(f => f.Id == requestId && f.FriendId == userMongoId).FirstOrDefaultAsync();
-            if (friendRequest == null)
-            {
-                await Clients.Caller.SendAsync("Error", "Friend request not found");
-                return;
-            }
-
-            // Delete the friend request
-            await _context.Friends.DeleteOneAsync(f => f.Id == requestId);
-
-            // Get friend IdentityUserId for notification
-            var friend = await _context.Users.Find(u => u.Id == friendRequest.UserId).FirstOrDefaultAsync();
-            var friendIdentityId = friend?.IdentityUserId;
-
-            // Notify sender
-            if (!string.IsNullOrEmpty(friendIdentityId))
-            {
-                await Clients.Group($"user_{friendIdentityId}").SendAsync("FriendRequestDeclined", new
-                {
-                    RequestId = requestId,
-                    DeclinedBy = userId, // Use IdentityUserId for frontend
-                    Timestamp = DateTime.UtcNow.ToString("O") // ISO 8601 format
-                });
-            }
-
-            await Clients.Caller.SendAsync("FriendRequestDeclined", new
-            {
-                RequestId = requestId,
-                Timestamp = DateTime.UtcNow.ToString("O") // ISO 8601 format
-            });
-
-            _logger.LogInformation($"Friend request {requestId} declined by {userId}");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error declining friend request");
-            await Clients.Caller.SendAsync("Error", "Failed to decline friend request");
-        }
+        _logger.LogInformation($"⚠️  FriendHub.DeclineFriendRequest DISABLED to prevent duplicate notifications. RequestId: {requestId}");
+        // TEMPORARILY DISABLED: This method was causing duplicate notifications with HTTP API
+        await Clients.Caller.SendAsync("Error", "Please use the web interface to decline friend requests");
+        return;
     }
 
     public async Task RemoveFriend(string friendId)
