@@ -307,6 +307,13 @@ public class FeedController : ControllerBase
 		}
 		try
 		{
+			// Validate emoji - only allow the 5 predefined reactions
+			var validEmojis = new[] { "👍", "❤️", "😂", "😮", "🔥", "👏" };
+			if (string.IsNullOrEmpty(request.Emoji) || !validEmojis.Contains(request.Emoji))
+			{
+				return BadRequest(new { success = false, message = "Invalid emoji. Only predefined reactions are allowed." });
+			}
+
 			request.CreatedAt = DateTime.UtcNow;
 			DateTime WeekStartUtc()
 			{
@@ -341,6 +348,83 @@ public class FeedController : ControllerBase
 				}
 			}
 
+			// Special handling for now_playing reactions - redirect to recent_song post
+			if (request.ContextType == "now_playing" && !string.IsNullOrEmpty(request.ToIdentityUserId) && !string.IsNullOrEmpty(request.SongId))
+			{
+				Console.WriteLine($"[Reaction] Processing now_playing reaction: User={request.ToIdentityUserId}, Song={request.SongId}, Emoji={request.Emoji}");
+				
+				// Check if Feed collection is available
+				if (_context.Feed == null)
+				{
+					Console.WriteLine($"[Reaction ERROR] Feed collection is null! Cannot redirect now_playing reaction.");
+					return BadRequest(new { success = false, message = "Feed service unavailable" });
+				}
+				
+				// Look for a recent_song post for the same user and song
+				var recentSongPost = await _context.Feed
+					.Find(f => f.IdentityUserId == request.ToIdentityUserId && f.Type == "recent_song" && f.SongId == request.SongId)
+					.SortByDescending(f => f.PlayedAt)
+					.FirstOrDefaultAsync();
+				
+				Console.WriteLine($"[Reaction] Database query completed. Found recent_song post: {recentSongPost != null}");
+				
+				if (recentSongPost != null)
+				{
+					// Redirect the reaction to the recent_song post
+					request.PostId = recentSongPost.Id;
+					request.ContextType = "recent_song";
+					Console.WriteLine($"[Reaction] SUCCESS: Redirecting now_playing reaction to recent_song post: {recentSongPost.Id} (PlayedAt: {recentSongPost.PlayedAt})");
+				}
+				else
+				{
+					// Debug: Let's see what recent_song posts exist for this user
+					var allRecentSongs = await _context.Feed
+						.Find(f => f.IdentityUserId == request.ToIdentityUserId && f.Type == "recent_song")
+						.SortByDescending(f => f.PlayedAt)
+						.Limit(5)
+						.ToListAsync();
+					Console.WriteLine($"[Reaction DEBUG] User {request.ToIdentityUserId} has {allRecentSongs.Count} recent_song posts:");
+					foreach (var song in allRecentSongs)
+					{
+						Console.WriteLine($"  - SongId: {song.SongId}, Title: {song.SongTitle}, PlayedAt: {song.PlayedAt}");
+					}
+					
+					// Try different approaches to find a matching recent_song post
+					FeedItem? targetPost = null;
+					
+					// 1. Try exact songId match (case-insensitive)
+					targetPost = allRecentSongs.FirstOrDefault(s => 
+						string.Equals(s.SongId, request.SongId, StringComparison.OrdinalIgnoreCase));
+					
+					if (targetPost == null)
+					{
+						// 2. Try matching by song title (case-insensitive)
+						targetPost = allRecentSongs.FirstOrDefault(s => 
+							!string.IsNullOrEmpty(s.SongTitle) && !string.IsNullOrEmpty(request.SongTitle) &&
+							string.Equals(s.SongTitle.Trim(), request.SongTitle.Trim(), StringComparison.OrdinalIgnoreCase));
+					}
+					
+					if (targetPost == null)
+					{
+						// 3. As last resort, use the most recent song by this user
+						targetPost = allRecentSongs.FirstOrDefault();
+					}
+					
+					if (targetPost != null)
+					{
+						Console.WriteLine($"[Reaction] Redirecting to recent_song post: {targetPost.Id} (SongId: {targetPost.SongId}, Title: {targetPost.SongTitle})");
+						request.PostId = targetPost.Id;
+						request.ContextType = "recent_song";
+					}
+					else
+					{
+						// This user has never listened to any songs - we can't create a meaningful reaction
+						Console.WriteLine($"[Reaction ERROR] User {request.ToIdentityUserId} has no listening history. Cannot process now_playing reaction.");
+						return BadRequest(new { success = false, message = "Cannot react to now playing - user has no listening history." });
+					}
+				}
+			}
+
 			// Check if reaction already exists (for toggle behavior)
 			var existingReaction = await _context.Reactions!
 				.Find(r => r.PostId == request.PostId && 
@@ -357,7 +441,9 @@ public class FeedController : ControllerBase
 			else
 			{
 				// Add new reaction (toggle on)
+				Console.WriteLine($"[Reaction] Adding new reaction: PostId={request.PostId}, ContextType={request.ContextType}, Emoji={request.Emoji}, From={request.FromIdentityUserId}, To={request.ToIdentityUserId}");
 				await _context.Reactions!.InsertOneAsync(request);
+				Console.WriteLine($"[Reaction] SUCCESS: Reaction added with ID: {request.Id}");
 				return Ok(new { success = true, message = "Reaction sent", action = "added" });
 			}
 		}

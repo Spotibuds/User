@@ -902,6 +902,50 @@ public class UsersController : ControllerBase
                     .Set(f => f.CreatedAt, feedItem.CreatedAt);
                 await _context.Feed.UpdateOneAsync(upsertFilter, updateDef, new UpdateOptions { IsUpsert = true });
 
+                // Migrate any now_playing reactions to this recent_song post
+                if (_context.Reactions != null)
+                {
+                    var syntheticPostId = $"nowplaying:{identityUserId}:{dto.SongId}";
+                    Console.WriteLine($"[Migration] Checking for reactions with synthetic postId: {syntheticPostId}");
+                    
+                    var nowPlayingReactions = await _context.Reactions
+                        .Find(r => r.PostId == syntheticPostId)
+                        .ToListAsync();
+                    
+                    Console.WriteLine($"[Migration] Found {nowPlayingReactions.Count} now_playing reactions to migrate for song {dto.SongId}");
+                    
+                    if (nowPlayingReactions.Any())
+                    {
+                        Console.WriteLine($"[Migration] Migrating {nowPlayingReactions.Count} reactions from synthetic postId {syntheticPostId} to feedItem {feedItem.Id}");
+                        
+                        // Update all reactions to point to the new recent_song post
+                        foreach (var reaction in nowPlayingReactions)
+                        {
+                            Console.WriteLine($"  - Migrating reaction: {reaction.Emoji} from {reaction.FromUserName} (ID: {reaction.Id})");
+                            reaction.PostId = feedItem.Id;
+                            reaction.ContextType = "recent_song";
+                        }
+                        
+                        // Bulk update the reactions
+                        var bulkOps = nowPlayingReactions.Select(r => 
+                            new ReplaceOneModel<User.Entities.Reaction>(
+                                Builders<User.Entities.Reaction>.Filter.Eq(x => x.Id, r.Id), 
+                                r
+                            )
+                        ).ToList();
+                        
+                        if (bulkOps.Any())
+                        {
+                            await _context.Reactions.BulkWriteAsync(bulkOps);
+                            Console.WriteLine($"[Migration] SUCCESS: Migrated {bulkOps.Count} reactions from now_playing to recent_song post {feedItem.Id}");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[Migration] No synthetic now_playing reactions found for postId: {syntheticPostId}");
+                    }
+                }
+
                 // Trim to last N recent_song items per user (configurable via env FEED_RECENT_MAX)
                 int maxRecent = 20;
                 var envMax = Environment.GetEnvironmentVariable("FEED_RECENT_MAX");
