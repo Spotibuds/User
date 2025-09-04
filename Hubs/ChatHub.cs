@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.SignalR;
 using MongoDB.Driver;
 using User.Data;
 using User.Entities;
+using User.Services;
 
 namespace User.Hubs;
 
@@ -9,11 +10,22 @@ public class ChatHub : Hub
 {
     private readonly MongoDbContext _context;
     private readonly ILogger<ChatHub> _logger;
+    private readonly INotificationService _notificationService;
+    private readonly IHubContext<NotificationHub> _notificationHubContext;
+    private readonly IActiveChatTrackingService _activeChatTracking;
 
-    public ChatHub(MongoDbContext context, ILogger<ChatHub> logger)
+    public ChatHub(
+        MongoDbContext context, 
+        ILogger<ChatHub> logger,
+        INotificationService notificationService,
+        IHubContext<NotificationHub> notificationHubContext,
+        IActiveChatTrackingService activeChatTracking)
     {
         _context = context;
         _logger = logger;
+        _notificationService = notificationService;
+        _notificationHubContext = notificationHubContext;
+        _activeChatTracking = activeChatTracking;
     }
 
     public override async Task OnConnectedAsync()
@@ -33,6 +45,10 @@ public class ChatHub : Hub
         if (!string.IsNullOrEmpty(userId))
         {
             await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"user_{userId}");
+            
+            // Remove user from all active chats
+            _activeChatTracking.RemoveUserFromAllChats(userId);
+            
             _logger.LogInformation($"User {userId} disconnected from chat hub");
         }
         await base.OnDisconnectedAsync(exception);
@@ -71,6 +87,10 @@ public async Task JoinChat(string chatId)
     }
 
     await Groups.AddToGroupAsync(Context.ConnectionId, $"chat_{chatId}");
+    
+    // Track that this user is currently viewing the chat
+    _activeChatTracking.AddUserToChat(chatId, userId);
+    
     await Clients.Caller.SendAsync("JoinedChat", chatId);
     
     _logger.LogInformation($"User {userId} joined chat {chatId}");
@@ -78,10 +98,18 @@ public async Task JoinChat(string chatId)
 
     public async Task LeaveChat(string chatId)
     {
+        var userId = Context.UserIdentifier;
+        
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"chat_{chatId}");
+        
+        // Remove user from active chat tracking
+        if (!string.IsNullOrEmpty(userId))
+        {
+            _activeChatTracking.RemoveUserFromChat(chatId, userId);
+        }
+        
         await Clients.Caller.SendAsync("LeftChat", chatId);
         
-        var userId = Context.UserIdentifier;
         _logger.LogInformation($"User {userId} left chat {chatId}");
     }
 
@@ -164,6 +192,9 @@ public async Task JoinChat(string chatId)
 
         // Send to all participants in the chat
         await Clients.Group($"chat_{chatId}").SendAsync("ReceiveMessage", messageDto);
+        
+        // Send notifications to other participants
+        await SendChatMessageNotifications(chat, message, user, content);
         
         _logger.LogInformation($"Message sent in chat {chatId} by user {userId}");
     }
@@ -248,6 +279,123 @@ public async Task JoinChat(string chatId)
         if (!string.IsNullOrEmpty(userId))
         {
             await Clients.OthersInGroup($"chat_{chatId}").SendAsync("UserStoppedTyping", userId);
+        }
+    }
+
+    /// <summary>
+    /// Send real-time notifications for new chat messages directly via SignalR
+    /// Only sends notifications to users who are NOT currently viewing the chat
+    /// </summary>
+    private async Task SendChatMessageNotifications(Entities.Chat chat, Entities.Message message, User.Models.User sender, string content)
+    {
+        try
+        {
+            // Get recipient users (exclude sender)
+            var recipientIds = chat.Participants.Where(p => p != sender.Id).ToList();
+            Console.WriteLine($"📢 DEBUG: chat.Participants = [{string.Join(", ", chat.Participants)}]");
+            Console.WriteLine($"📢 DEBUG: sender.Id = {sender.Id}");
+            Console.WriteLine($"📢 DEBUG: recipientIds = [{string.Join(", ", recipientIds)}]");
+
+            var recipientUsers = await _context.Users
+                .Find(u => recipientIds.Contains(u.Id))
+                .ToListAsync();
+
+            Console.WriteLine($"📢 DEBUG: Found {recipientUsers.Count} recipient users");
+            foreach (var user in recipientUsers)
+            {
+                Console.WriteLine($"📢 DEBUG: Recipient user - Id: {user.Id}, IdentityUserId: {user.IdentityUserId}, UserName: {user.UserName}");
+            }
+
+            foreach (var recipient in recipientUsers)
+            {
+                if (recipient.IdentityUserId == null) continue;
+
+                // Skip notification if user is currently viewing the chat
+                if (_activeChatTracking.IsUserInChat(chat.Id, recipient.IdentityUserId))
+                {
+                    _logger.LogInformation($"Skipping notification for user {recipient.IdentityUserId} - currently viewing chat {chat.Id}");
+                    continue;
+                }
+
+                // Create persistent notification
+                Console.WriteLine($"📢 DEBUG: recipient.Id = {recipient.Id}");
+                Console.WriteLine($"📢 DEBUG: recipient.IdentityUserId = {recipient.IdentityUserId}");
+                Console.WriteLine($"📢 DEBUG: recipient.UserName = {recipient.UserName}");
+                Console.WriteLine($"📢 DEBUG: sender.Id = {sender.Id}");
+                Console.WriteLine($"📢 DEBUG: sender.IdentityUserId = {sender.IdentityUserId}");
+                Console.WriteLine($"📢 Creating notification for {recipient.IdentityUserId} about message from {sender.UserName ?? "Unknown User"}");
+
+                if (string.IsNullOrEmpty(recipient.IdentityUserId))
+                {
+                    Console.WriteLine($"❌ ERROR: recipient.IdentityUserId is null or empty! Cannot create notification.");
+                    continue;
+                }
+
+                await _notificationService.CreateNotificationAsync(
+                    targetUserId: recipient.IdentityUserId,
+                    type: Entities.NotificationType.Message,
+                    title: $"New message from {sender.UserName ?? "Unknown User"}",
+                    message: content.Length > 50 ? $"{content.Substring(0, 50)}..." : content,
+                    sourceUserId: sender.IdentityUserId,
+                    data: new Dictionary<string, object>
+                    {
+                        { "chatId", chat.Id },
+                        { "messageId", message.Id },
+                        { "senderUsername", sender.UserName ?? "Unknown User" },
+                        { "senderAvatar", sender.AvatarUrl ?? "" }
+                    },
+                    actionUrl: $"/chat/{chat.Id}"
+                );
+                Console.WriteLine($"✅ Notification created for {recipient.IdentityUserId}");
+
+                // Send real-time notification via SignalR (same pattern as friend notifications)
+                Console.WriteLine($"📡 Sending SignalR notification to group notifications_{recipient.IdentityUserId}");
+                await _notificationHubContext.Clients.Group($"notifications_{recipient.IdentityUserId}")
+                    .SendAsync("NewNotification", new
+                    {
+                        Type = "Message",
+                        Title = $"New message from {sender.UserName ?? "Unknown User"}",
+                        Message = content.Length > 50 ? $"{content.Substring(0, 50)}..." : content,
+                        SourceUserId = sender.IdentityUserId,
+                        SourceUserName = sender.UserName ?? "Unknown User",
+                        SourceUserAvatar = sender.AvatarUrl ?? "",
+                        Data = new Dictionary<string, object>
+                        {
+                            { "chatId", chat.Id },
+                            { "messageId", message.Id },
+                            { "senderUsername", sender.UserName ?? "Unknown User" },
+                            { "senderAvatar", sender.AvatarUrl ?? "" }
+                        },
+                        ActionUrl = $"/chat/{chat.Id}",
+                        Timestamp = message.SentAt.ToString("O")
+                    });
+                Console.WriteLine($"📡 SignalR notification sent successfully");
+
+                // Update unread count for this chat
+                var chatUnreadCount = await _context.Messages
+                    .Find(m => m.ChatId == chat.Id &&
+                              m.SenderId != recipient.Id &&
+                              !m.ReadBy.Any(r => r.UserId == recipient.Id))
+                    .CountDocumentsAsync();
+
+                await _notificationHubContext.Clients.Group($"notifications_{recipient.IdentityUserId}")
+                    .SendAsync("ChatUnreadCountUpdate", new
+                    {
+                        chatId = chat.Id,
+                        unreadCount = (int)chatUnreadCount
+                    });
+
+                // Update general unread count
+                var unreadCount = await _notificationService.GetUnreadCountAsync(recipient.IdentityUserId);
+                await _notificationHubContext.Clients.Group($"notifications_{recipient.IdentityUserId}")
+                    .SendAsync("UnreadCountUpdate", unreadCount);
+
+                _logger.LogInformation($"Sent notification to user {recipient.IdentityUserId} for message in chat {chat.Id}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send chat message notifications");
         }
     }
 } 

@@ -54,7 +54,9 @@ public class NotificationService : INotificationService
             };
 
             await _context.Notifications.InsertOneAsync(notification);
-            
+
+            Console.WriteLine($"📝 Created notification in DB: ID={notification.Id}, Type={type}, Target={targetUserId}");
+            Console.WriteLine($"📝 Notification details: Title='{notification.Title}', Message='{notification.Message}'");
             _logger.LogInformation($"Created notification for user {targetUserId}: {type}");
         }
         catch (Exception ex)

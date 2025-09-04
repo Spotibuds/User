@@ -286,6 +286,8 @@ builder.Services.AddScoped<INotificationService, NotificationService>();
 builder.Services.AddScoped<IRabbitMqEventService, RabbitMqEventService>();
 // Now register FriendNotificationService after its dependencies
 builder.Services.AddScoped<IFriendNotificationService, FriendNotificationServiceSimple>();
+// Register active chat tracking service
+builder.Services.AddSingleton<IActiveChatTrackingService, ActiveChatTrackingService>();
 // Register weekly background job for Top Artists
 builder.Services.AddHostedService<WeeklyTopArtistsService>();
 // Register RabbitMQ consumer service

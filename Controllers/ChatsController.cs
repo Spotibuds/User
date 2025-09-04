@@ -1,8 +1,11 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using MongoDB.Driver;
 using User.Data;
 using User.Services;
+using User.Hubs;
 using System.Security.Claims;
+using UserEntity = User.Models.User;
 
 namespace User.Controllers;
 
@@ -12,11 +15,25 @@ public class ChatsController : ControllerBase
 {
     private readonly MongoDbContext _context;
     private readonly IRabbitMqService? _rabbitMq;
+    private readonly INotificationService _notificationService;
+    private readonly IHubContext<NotificationHub> _notificationHubContext;
+    private readonly ILogger<ChatsController> _logger;
+    private readonly IActiveChatTrackingService _activeChatTracking;
 
-    public ChatsController(MongoDbContext context, IRabbitMqService? rabbitMq)
+    public ChatsController(
+        MongoDbContext context, 
+        IRabbitMqService? rabbitMq,
+        INotificationService notificationService,
+        IHubContext<NotificationHub> notificationHubContext,
+        ILogger<ChatsController> logger,
+        IActiveChatTrackingService activeChatTracking)
     {
         _context = context;
         _rabbitMq = rabbitMq;
+        _notificationService = notificationService;
+        _notificationHubContext = notificationHubContext;
+        _logger = logger;
+        _activeChatTracking = activeChatTracking;
     }
 
     private string? GetUserIdFromClaims()
@@ -41,7 +58,6 @@ public class ChatsController : ControllerBase
     {
         if (!_context.IsConnected || _context.Chats == null)
         {
-            Console.WriteLine("CreateOrGetChat: MongoDB not connected or Chats collection is null");
             return StatusCode(503, "Service unavailable - database connection failed");
         }
 
@@ -242,7 +258,6 @@ public class ChatsController : ControllerBase
         }
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        Console.WriteLine($"GetUserChats: Starting request for userId: {userId}");
 
         try
         {
@@ -298,6 +313,76 @@ public class ChatsController : ControllerBase
                     }
                 }
 
+                // Get the last message content if it exists
+                string? lastMessageContent = null;
+                string? lastMessageSenderId = null;
+
+                if (!string.IsNullOrEmpty(chat.LastMessageId))
+                {
+                    var lastMessage = await _context.Messages
+                        .Find(m => m.Id == chat.LastMessageId)
+                        .FirstOrDefaultAsync();
+
+                    if (lastMessage != null)
+                    {
+                        lastMessageContent = lastMessage.Content;
+
+                        // Convert sender MongoDB _id to IdentityUserId
+                        var sender = await _context.Users
+                            .Find(u => u.Id == lastMessage.SenderId)
+                            .FirstOrDefaultAsync();
+                        lastMessageSenderId = sender?.IdentityUserId ?? lastMessage.SenderId;
+                    }
+                    else
+                    {
+                        // LastMessageId exists but message not found - try to find the most recent message
+                        var recentMessage = await _context.Messages
+                            .Find(m => m.ChatId == chat.Id)
+                            .SortByDescending(m => m.SentAt)
+                            .FirstOrDefaultAsync();
+
+                        if (recentMessage != null)
+                        {
+                            lastMessageContent = recentMessage.Content;
+                            var sender = await _context.Users
+                                .Find(u => u.Id == recentMessage.SenderId)
+                                .FirstOrDefaultAsync();
+                            lastMessageSenderId = sender?.IdentityUserId ?? recentMessage.SenderId;
+
+                            // Update the chat's LastMessageId to fix it for future calls
+                            await _context.Chats.UpdateOneAsync(
+                                c => c.Id == chat.Id,
+                                Builders<Entities.Chat>.Update
+                                    .Set(c => c.LastMessageId, recentMessage.Id)
+                                    .Set(c => c.LastActivity, recentMessage.SentAt));
+                        }
+                    }
+                }
+                else
+                {
+                    // No LastMessageId set - try to find the most recent message and set it
+                    var recentMessage = await _context.Messages
+                        .Find(m => m.ChatId == chat.Id)
+                        .SortByDescending(m => m.SentAt)
+                        .FirstOrDefaultAsync();
+
+                    if (recentMessage != null)
+                    {
+                        lastMessageContent = recentMessage.Content;
+                        var sender = await _context.Users
+                            .Find(u => u.Id == recentMessage.SenderId)
+                            .FirstOrDefaultAsync();
+                        lastMessageSenderId = sender?.IdentityUserId ?? recentMessage.SenderId;
+
+                        // Update the chat's LastMessageId to fix it for future calls
+                        await _context.Chats.UpdateOneAsync(
+                            c => c.Id == chat.Id,
+                            Builders<Entities.Chat>.Update
+                                .Set(c => c.LastMessageId, recentMessage.Id)
+                                .Set(c => c.LastActivity, recentMessage.SentAt));
+                    }
+                }
+
                 chatList.Add(new
                 {
                     chatId = chat.Id,
@@ -306,24 +391,23 @@ public class ChatsController : ControllerBase
                     participants = participantIdentityIds,
                     lastActivity = chat.LastActivity,
                     lastMessageId = chat.LastMessageId,
+                    lastMessageContent = lastMessageContent,
+                    lastMessageSenderId = lastMessageSenderId,
                     createdAt = chat.CreatedAt
                 });
             }
 
             stopwatch.Stop();
-            Console.WriteLine($"GetUserChats: Completed successfully in {stopwatch.ElapsedMilliseconds}ms, returned {chatList.Count} chats");
             return Ok(chatList);
         }
         catch (MongoDB.Driver.MongoConnectionException ex)
         {
             stopwatch.Stop();
-            Console.WriteLine($"GetUserChats: MongoDB connection error after {stopwatch.ElapsedMilliseconds}ms: {ex.Message}");
             return StatusCode(503, new { message = "Database temporarily unavailable", error = ex.Message });
         }
         catch (Exception ex)
         {
             stopwatch.Stop();
-            Console.WriteLine($"GetUserChats: Unexpected error after {stopwatch.ElapsedMilliseconds}ms: {ex.Message}");
             return StatusCode(500, new { message = "Internal server error", error = ex.Message });
         }
     }
@@ -336,7 +420,6 @@ public class ChatsController : ControllerBase
     {
         if (!_context.IsConnected || _context.Chats == null || _context.Messages == null)
         {
-            Console.WriteLine("GetChatMessages: MongoDB not connected or collections are null");
             return StatusCode(503, "Service unavailable - database connection failed");
         }
 
@@ -465,21 +548,8 @@ public class ChatsController : ControllerBase
                 .Set(c => c.LastMessageId, message.Id)
                 .Set(c => c.LastActivity, DateTime.UtcNow));
 
-        // Send notification to other participants
-        var notification = new Services.ChatMessageNotification
-        {
-            ChatId = chatId,
-            MessageId = message.Id,
-            SenderId = user.Id, // Use MongoDB _id
-            Content = dto.Content,
-            SentAt = message.SentAt,
-            Recipients = chat.Participants.Where(p => p != user.Id).ToList() // Use MongoDB _id
-        };
-
-        if (_rabbitMq != null)
-        {
-            await _rabbitMq.PublishMessageAsync("chat.message", notification);
-        }
+        // Send real-time notifications directly to other participants
+        await SendChatMessageNotifications(chat, message, user, dto.Content);
 
         // Convert sender MongoDB _id back to IdentityUserId
         var sender = await _context.Users
@@ -655,6 +725,222 @@ public class ChatsController : ControllerBase
         await _context.Chats.DeleteOneAsync(c => c.Id == chatId);
 
         return Ok(new { message = "Chat deleted successfully" });
+    }
+
+    /// <summary>
+    /// Get unread message counts for all user chats
+    /// </summary>
+    [HttpGet("unread-counts")]
+    public async Task<ActionResult<Dictionary<string, int>>> GetUnreadMessageCounts()
+    {
+        var currentUserId = GetUserIdFromClaims();
+        if (string.IsNullOrEmpty(currentUserId))
+        {
+            return Unauthorized("User not authenticated");
+        }
+
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            return Unauthorized("User not found in database");
+        }
+
+        // Get all chats for the user
+        var userChats = await _context.Chats
+            .Find(c => c.Participants.Contains(user.Id))
+            .ToListAsync();
+
+        var unreadCounts = new Dictionary<string, int>();
+
+        foreach (var chat in userChats)
+        {
+            // Count messages in this chat that haven't been read by the current user
+            // Exclude messages sent by the current user
+            var unreadCount = await _context.Messages
+                .Find(m => m.ChatId == chat.Id &&
+                          m.SenderId != user.Id &&  // Exclude own messages
+                          !m.ReadBy.Any(r => r.UserId == user.Id))
+                .CountDocumentsAsync();
+
+
+            unreadCounts[chat.Id] = (int)unreadCount;
+        }
+
+        return Ok(unreadCounts);
+    }
+
+    /// <summary>
+    /// Get unread message count for a specific chat
+    /// </summary>
+    [HttpGet("{chatId}/unread-count")]
+    public async Task<ActionResult<int>> GetChatUnreadCount(string chatId)
+    {
+        var currentUserId = GetUserIdFromClaims();
+        if (string.IsNullOrEmpty(currentUserId))
+        {
+            return Unauthorized("User not authenticated");
+        }
+
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            return Unauthorized("User not found in database");
+        }
+
+        // Verify user has access to this chat
+        var chat = await _context.Chats
+            .Find(c => c.Id == chatId && c.Participants.Contains(user.Id))
+            .FirstOrDefaultAsync();
+
+        if (chat == null)
+        {
+            return NotFound("Chat not found or access denied");
+        }
+
+        // Count unread messages in this chat
+        // Exclude messages sent by the current user
+        var unreadCount = await _context.Messages
+            .Find(m => m.ChatId == chatId && 
+                      m.SenderId != user.Id &&  // Exclude own messages
+                      !m.ReadBy.Any(r => r.UserId == user.Id))
+            .CountDocumentsAsync();
+
+        return Ok((int)unreadCount);
+    }
+
+    /// <summary>
+    /// Mark all messages in a chat as read for the current user
+    /// </summary>
+    [HttpPost("{chatId}/mark-all-read")]
+    public async Task<ActionResult> MarkAllMessagesAsRead(string chatId)
+    {
+        var currentUserId = GetUserIdFromClaims();
+        if (string.IsNullOrEmpty(currentUserId))
+        {
+            return Unauthorized("User not authenticated");
+        }
+
+        // Convert IdentityUserId to MongoDB _id
+        var user = await _context.Users
+            .Find(u => u.IdentityUserId == currentUserId)
+            .FirstOrDefaultAsync();
+            
+        if (user == null)
+        {
+            return Unauthorized("User not found in database");
+        }
+
+        // Verify user has access to this chat
+        var chat = await _context.Chats
+            .Find(c => c.Id == chatId && c.Participants.Contains(user.Id))
+            .FirstOrDefaultAsync();
+
+        if (chat == null)
+        {
+            return NotFound("Chat not found or access denied");
+        }
+
+        // Get all unread messages in this chat
+        var unreadMessages = await _context.Messages
+            .Find(m => m.ChatId == chatId && 
+                      !m.ReadBy.Any(r => r.UserId == user.Id))
+            .ToListAsync();
+
+        // Mark each message as read
+        foreach (var message in unreadMessages)
+        {
+            message.ReadBy.Add(new Entities.MessageRead 
+            { 
+                UserId = user.Id, 
+                ReadAt = DateTime.UtcNow 
+            });
+
+            await _context.Messages.ReplaceOneAsync(m => m.Id == message.Id, message);
+        }
+
+        return Ok(new { message = $"Marked {unreadMessages.Count} messages as read" });
+    }
+
+    /// <summary>
+    /// Send real-time notifications for new chat messages directly via SignalR
+    /// </summary>
+    private async Task SendChatMessageNotifications(Entities.Chat chat, Entities.Message message, UserEntity sender, string content)
+    {
+        try
+        {
+            // Get recipient users (exclude sender)
+            var recipientIds = chat.Participants.Where(p => p != sender.Id).ToList();
+            var recipientUsers = await _context.Users
+                .Find(u => recipientIds.Contains(u.Id))
+                .ToListAsync();
+
+            foreach (var recipient in recipientUsers)
+            {
+                if (recipient.IdentityUserId == null) continue;
+
+                // Skip notification if user is currently viewing the chat
+                if (_activeChatTracking.IsUserInChat(chat.Id, recipient.IdentityUserId))
+                {
+                    _logger.LogInformation($"Skipping notification for user {recipient.IdentityUserId} - currently viewing chat {chat.Id}");
+                    continue;
+                }
+
+                // Create persistent notification
+                await _notificationService.CreateNotificationAsync(
+                    targetUserId: recipient.IdentityUserId,
+                    type: Entities.NotificationType.Message,
+                    title: $"New message from {sender.UserName ?? "Unknown User"}",
+                    message: content.Length > 50 ? $"{content.Substring(0, 50)}..." : content,
+                    sourceUserId: sender.IdentityUserId,
+                    data: new Dictionary<string, object>
+                    {
+                        { "chatId", chat.Id },
+                        { "messageId", message.Id },
+                        { "senderUsername", sender.UserName ?? "Unknown User" },
+                        { "senderAvatar", sender.AvatarUrl ?? "" }
+                    },
+                    actionUrl: $"/chat/{chat.Id}"
+                );
+
+                // Send real-time notification via SignalR (same pattern as friend notifications)
+                await _notificationHubContext.Clients.Group($"notifications_{recipient.IdentityUserId}")
+                    .SendAsync("NewNotification", new
+                    {
+                        Type = "Message",
+                        Title = $"New message from {sender.UserName ?? "Unknown User"}",
+                        Message = content.Length > 50 ? $"{content.Substring(0, 50)}..." : content,
+                        SourceUserId = sender.IdentityUserId,
+                        SourceUserName = sender.UserName ?? "Unknown User",
+                        SourceUserAvatar = sender.AvatarUrl ?? "",
+                        Data = new Dictionary<string, object>
+                        {
+                            { "chatId", chat.Id },
+                            { "messageId", message.Id },
+                            { "senderUsername", sender.UserName ?? "Unknown User" },
+                            { "senderAvatar", sender.AvatarUrl ?? "" }
+                        },
+                        ActionUrl = $"/chat/{chat.Id}",
+                        Timestamp = message.SentAt.ToString("O")
+                    });
+
+                // Update unread count
+                var unreadCount = await _notificationService.GetUnreadCountAsync(recipient.IdentityUserId);
+                await _notificationHubContext.Clients.Group($"notifications_{recipient.IdentityUserId}")
+                    .SendAsync("UnreadCountUpdate", unreadCount);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send chat message notifications");
+        }
     }
 }
 

@@ -31,9 +31,10 @@ public class RabbitMqConsumerService : BackgroundService
 
         try
         {
-            // TEMPORARILY DISABLED: Start consuming friend events to debug duplicate notifications
+            // DISABLED: RabbitMQ consumers no longer needed - using direct SignalR notifications
             // _rabbitMqService.StartConsumingAsync("spotibuds.notifications", HandleFriendEventMessage);
-            _logger.LogInformation("RabbitMQ consumer temporarily disabled for friend events (debugging duplicates)");
+            // _rabbitMqService.StartConsumingAsync("chat.message", HandleChatMessageNotification);
+            _logger.LogInformation("RabbitMQ consumers disabled - using direct SignalR notifications for better performance");
         }
         catch (Exception ex)
         {
@@ -41,6 +42,13 @@ public class RabbitMqConsumerService : BackgroundService
         }
 
         return Task.CompletedTask;
+    }
+
+    private async Task HandleChatMessageNotification(string message)
+    {
+        // DISABLED: Chat message notifications now handled directly in ChatsController via SignalR
+        _logger.LogInformation("Chat message notification handler disabled - using direct SignalR approach");
+        await Task.CompletedTask;
     }
 
     private async Task HandleFriendEventMessage(string message)
