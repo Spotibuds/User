@@ -999,6 +999,9 @@ public class UsersController : ControllerBase
                 .Take(limit)
                 .ToList();
 
+            // Update cover URLs by fetching fresh data from Music service
+            await UpdateListeningHistoryWithFreshCoverUrls(history);
+
             return Ok(history);
         }
         catch (Exception ex)
@@ -1033,11 +1036,77 @@ public class UsersController : ControllerBase
                 .Take(limit)
                 .ToList();
 
+            // Update cover URLs by fetching fresh data from Music service
+            await UpdateListeningHistoryWithFreshCoverUrls(history);
+
             return Ok(history);
         }
         catch (Exception ex)
         {
             return StatusCode(500, $"Error retrieving listening history: {ex.Message}");
+        }
+    }
+
+    private async Task UpdateListeningHistoryWithFreshCoverUrls(List<ListeningHistoryItem> history)
+    {
+        try
+        {
+            using var httpClient = new HttpClient();
+            httpClient.BaseAddress = new Uri("http://localhost:5001/");
+            httpClient.Timeout = TimeSpan.FromSeconds(5); // Reduced timeout to avoid blocking
+
+            // Group by song ID to avoid duplicate API calls
+            var songIds = history.Select(h => h.SongId).Distinct().ToList();
+            var songDataCache = new Dictionary<string, string>();
+
+            var tasks = songIds.Select(async songId =>
+            {
+                try
+                {
+                    var response = await httpClient.GetAsync($"api/songs/{songId}");
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var songJson = await response.Content.ReadAsStringAsync();
+                        var songData = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(songJson);
+                        
+                        if (songData.TryGetProperty("coverUrl", out var coverUrlElement))
+                        {
+                            var coverUrl = coverUrlElement.GetString();
+                            if (!string.IsNullOrEmpty(coverUrl))
+                            {
+                                lock (songDataCache)
+                                {
+                                    songDataCache[songId] = coverUrl;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Log but don't fail the entire request for one song
+                    Console.WriteLine($"Failed to get cover URL for song {songId}: {ex.Message}");
+                }
+            });
+
+            // Wait for all requests with a timeout
+            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10));
+
+            // Update history items with fresh cover URLs
+            foreach (var item in history)
+            {
+                if (songDataCache.ContainsKey(item.SongId))
+                {
+                    item.CoverUrl = songDataCache[item.SongId];
+                }
+            }
+
+            Console.WriteLine($"Updated {songDataCache.Count} cover URLs from Music service");
+        }
+        catch (Exception ex)
+        {
+            // Log but don't fail the entire request if Music service is unavailable
+            Console.WriteLine($"Failed to update cover URLs from Music service: {ex.Message}");
         }
     }
 
