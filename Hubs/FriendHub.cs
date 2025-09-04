@@ -309,6 +309,9 @@ public class FriendHub : Hub
 
             await _context.Friends.DeleteOneAsync(f => f.Id == friendRelationship.Id);
 
+            // NOTE: Friend removal notifications now handled by NotificationHub via FriendNotificationServiceSimple
+            // Commenting out to prevent duplicate notifications
+            /*
             // Notify both users
             await Clients.Group($"user_{friendId}").SendAsync("FriendRemoved", new
             {
@@ -321,6 +324,7 @@ public class FriendHub : Hub
                 RemovedFriendId = friendId, // Use IdentityUserId for frontend
                 Timestamp = DateTime.UtcNow
             });
+            */
 
             _logger.LogInformation($"Friend relationship removed between {userId} and {friendId}");
         }

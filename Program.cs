@@ -77,7 +77,8 @@ if (!string.IsNullOrEmpty(jwtSecret) && !string.IsNullOrEmpty(jwtIssuer) && !str
                     // Special handling for SignalR hub connections
                     if (!string.IsNullOrEmpty(accessToken) && 
                         (path.StartsWithSegments("/friend-hub") || 
-                         path.StartsWithSegments("/chat-hub")))
+                         path.StartsWithSegments("/chat-hub") || 
+                         path.StartsWithSegments("/notification-hub")))
                     {
             // Extra debugging for negotiation paths which often have different requirements
             var tokenStr = accessToken.ToString();
@@ -97,7 +98,9 @@ if (!string.IsNullOrEmpty(jwtSecret) && !string.IsNullOrEmpty(jwtIssuer) && !str
                     {
                         Console.WriteLine($"Authorization header found for path: {path}");
                     }
-                    else if (path.StartsWithSegments("/friend-hub") || path.StartsWithSegments("/chat-hub")) 
+                    else if (path.StartsWithSegments("/friend-hub") || 
+                             path.StartsWithSegments("/chat-hub") || 
+                             path.StartsWithSegments("/notification-hub")) 
                     {
                         Console.WriteLine($"⚠️ WARNING: SignalR connection without token at path: {path}");
                     }
@@ -350,7 +353,7 @@ builder.Services.AddCors(options =>
     });
 });
 
-builder.WebHost.UseUrls($"http://0.0.0.0:80");
+builder.WebHost.UseUrls($"http://0.0.0.0:5002");
 
 var app = builder.Build();
 

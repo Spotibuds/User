@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.SignalR;
 using User.Hubs;
+using User.Entities;
 
 namespace User.Services;
 
@@ -7,15 +8,18 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
 {
     private readonly IHubContext<NotificationHub> _notificationHub;
     private readonly IHubContext<FriendHub> _friendHub;
+    private readonly INotificationService _notificationService;
     private readonly ILogger<FriendNotificationServiceSimple> _logger;
 
     public FriendNotificationServiceSimple(
         IHubContext<NotificationHub> notificationHub,
-        IHubContext<FriendHub> friendHub, 
+        IHubContext<FriendHub> friendHub,
+        INotificationService notificationService,
         ILogger<FriendNotificationServiceSimple> logger)
     {
         _notificationHub = notificationHub;
         _friendHub = friendHub;
+        _notificationService = notificationService;
         _logger = logger;
     }
 
@@ -23,9 +27,25 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
     {
         try
         {
-            _logger.LogInformation($"📢 Sending SignalR friend request notification from {requesterUsername} to {targetUserId} (FriendshipId: {friendshipId})");
+            _logger.LogInformation($"📢 Creating persistent friend request notification from {requesterUsername} to {targetUserId} (FriendshipId: {friendshipId})");
             
-            // Send notification to the target user's notification group using the same event name as persistent notifications
+            // First, create persistent notification in database
+            await _notificationService.CreateNotificationAsync(
+                targetUserId: targetUserId,
+                type: NotificationType.FriendRequest,
+                title: "New Friend Request",
+                message: $"{requesterUsername} sent you a friend request",
+                sourceUserId: userId,
+                data: new Dictionary<string, object>
+                {
+                    { "fromUserId", userId },
+                    { "fromUsername", requesterUsername },
+                    { "requestId", friendshipId },
+                    { "friendshipId", friendshipId }
+                }
+            );
+            
+            // Then send real-time SignalR notification 
             await _notificationHub.Clients.Group($"notifications_{targetUserId}")
                 .SendAsync("NewNotification", new { 
                     Type = "FriendRequest",
@@ -43,11 +63,11 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
                     Timestamp = DateTime.UtcNow.ToString("O")
                 });
                 
-            _logger.LogInformation($"✅ Successfully sent friend request SignalR notification to {targetUserId}");
+            _logger.LogInformation($"✅ Successfully created persistent notification and sent SignalR notification to {targetUserId}");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Failed to send friend request SignalR notification");
+            _logger.LogError(ex, "❌ Failed to send friend request notification");
         }
     }
 
@@ -55,9 +75,23 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
     {
         try
         {
-            _logger.LogInformation($"📢 Sending SignalR friend request accepted notification from {accepterUsername} to {userId}");
+            _logger.LogInformation($"📢 Creating persistent friend request accepted notification from {accepterUsername} to {userId}");
             
-            // Send notification to the original requester via NotificationHub
+            // First, create persistent notification in database
+            await _notificationService.CreateNotificationAsync(
+                targetUserId: userId,
+                type: NotificationType.FriendRequestAccepted,
+                title: "Friend Request Accepted",
+                message: $"{accepterUsername} accepted your friend request",
+                sourceUserId: friendId,
+                data: new Dictionary<string, object>
+                {
+                    { "friendId", friendId },
+                    { "accepterUsername", accepterUsername }
+                }
+            );
+            
+            // Then send real-time SignalR notification via NotificationHub
             await _notificationHub.Clients.Group($"notifications_{userId}")
                 .SendAsync("NewNotification", new { 
                     Type = "FriendRequestAccepted",
@@ -83,11 +117,11 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
                 Timestamp = DateTime.UtcNow.ToString("O")
             });
                 
-            _logger.LogInformation($"✅ Successfully sent friend request accepted SignalR notifications to {userId}");
+            _logger.LogInformation($"✅ Successfully created persistent notification and sent SignalR notifications to {userId}");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Failed to send friend request accepted SignalR notification");
+            _logger.LogError(ex, "❌ Failed to send friend request accepted notification");
         }
     }
 
@@ -95,10 +129,24 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
     {
         try
         {
-            _logger.LogInformation($"� FriendNotificationServiceSimple.NotifyFriendRequestDeclined called: userId={userId}, friendId={friendId}, declinerUsername={declinerUsername}");
-            _logger.LogInformation($"�📢 Sending SignalR friend request declined notification from {declinerUsername} to {userId}");
+            _logger.LogInformation($"💔 FriendNotificationServiceSimple.NotifyFriendRequestDeclined called: userId={userId}, friendId={friendId}, declinerUsername={declinerUsername}");
+            _logger.LogInformation($"📢 Creating persistent friend request declined notification from {declinerUsername} to {userId}");
             
-            // Send notification to the original requester  
+            // First, create persistent notification in database
+            await _notificationService.CreateNotificationAsync(
+                targetUserId: userId,
+                type: NotificationType.FriendRequestDeclined,
+                title: "Friend Request Declined",
+                message: $"{declinerUsername} declined your friend request",
+                sourceUserId: friendId,
+                data: new Dictionary<string, object>
+                {
+                    { "friendId", friendId },
+                    { "declinerUsername", declinerUsername }
+                }
+            );
+            
+            // Then send real-time SignalR notification to the original requester  
             await _notificationHub.Clients.Group($"notifications_{userId}")
                 .SendAsync("NewNotification", new { 
                     Type = "FriendRequestDeclined",
@@ -114,11 +162,11 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
                     Timestamp = DateTime.UtcNow.ToString("O")
                 });
                 
-            _logger.LogInformation($"✅ Successfully sent friend request declined SignalR notification to {userId}");
+            _logger.LogInformation($"✅ Successfully created persistent notification and sent SignalR notification to {userId}");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Failed to send friend request declined SignalR notification");
+            _logger.LogError(ex, "❌ Failed to send friend request declined notification");
         }
     }
 
@@ -126,9 +174,24 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
     {
         try
         {
-            _logger.LogInformation($"📢 Sending SignalR friend added notification for {friendUsername} to {userId}");
+            _logger.LogInformation($"📢 Creating persistent friend added notification for {friendUsername} to {userId}");
             
-            // Send notification to the user who accepted the friend request to update their friends list
+            // First, create persistent notification in database (using Other type since FriendAdded doesn't exist)
+            await _notificationService.CreateNotificationAsync(
+                targetUserId: userId,
+                type: NotificationType.Other,
+                title: "New Friend Added",
+                message: $"You are now friends with {friendUsername}",
+                sourceUserId: friendId,
+                data: new Dictionary<string, object>
+                {
+                    { "friendId", friendId },
+                    { "friendUsername", friendUsername },
+                    { "type", "FriendAdded" } // Add custom type for frontend identification
+                }
+            );
+            
+            // Then send real-time SignalR notification to the user who accepted the friend request to update their friends list
             await _notificationHub.Clients.Group($"notifications_{userId}")
                 .SendAsync("NewNotification", new { 
                     Type = "FriendAdded",
@@ -153,11 +216,11 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
                 Timestamp = DateTime.UtcNow.ToString("O")
             });
                 
-            _logger.LogInformation($"✅ Successfully sent friend added SignalR notifications to {userId}");
+            _logger.LogInformation($"✅ Successfully created persistent notification and sent SignalR notifications to {userId}");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Failed to send friend added SignalR notification");
+            _logger.LogError(ex, "❌ Failed to send friend added notification");
         }
     }
 
@@ -165,9 +228,23 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
     {
         try
         {
-            _logger.LogInformation($"📢 Sending SignalR friend removed notification: {removerUsername} (userId: {userId}) removed friendId: {friendId}");
+            _logger.LogInformation($"📢 Creating persistent friend removed notification: {removerUsername} (userId: {userId}) removed friendId: {friendId}");
             
-            // Send notification to the friend who was removed via NotificationHub
+            // First, create persistent notification in database
+            await _notificationService.CreateNotificationAsync(
+                targetUserId: friendId,
+                type: NotificationType.FriendRemoved,
+                title: "Friend Removed",
+                message: $"{removerUsername} removed you as a friend",
+                sourceUserId: userId,
+                data: new Dictionary<string, object>
+                {
+                    { "removerId", userId },
+                    { "removerUsername", removerUsername }
+                }
+            );
+            
+            // Then send real-time SignalR notification to the friend who was removed via NotificationHub
             await _notificationHub.Clients.Group($"notifications_{friendId}")
                 .SendAsync("NewNotification", new { 
                     Type = "FriendRemoved",
@@ -191,11 +268,11 @@ public class FriendNotificationServiceSimple : IFriendNotificationService
                 Timestamp = DateTime.UtcNow.ToString("O")
             });
 
-            _logger.LogInformation($"✅ Successfully sent friend removed SignalR notifications to {friendId} about {removerUsername}");
+            _logger.LogInformation($"✅ Successfully created persistent notification and sent SignalR notifications to {friendId} about {removerUsername}");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Failed to send friend removed SignalR notification");
+            _logger.LogError(ex, "❌ Failed to send friend removed notification");
         }
     }
 

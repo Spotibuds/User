@@ -182,6 +182,63 @@ public class NotificationsController : ControllerBase
             return StatusCode(500, new { message = "Failed to cleanup notifications" });
         }
     }
+
+    /// <summary>
+    /// Delete a single notification
+    /// </summary>
+    [HttpDelete("{notificationId}")]
+    public async Task<IActionResult> DeleteNotification(string notificationId, [FromQuery] string userId)
+    {
+        try
+        {
+            if (!_context.IsConnected || _context.Notifications == null)
+            {
+                return StatusCode(503, new { message = "Database temporarily unavailable" });
+            }
+
+            var result = await _context.Notifications.DeleteOneAsync(
+                n => n.Id == notificationId && n.TargetUserId == userId
+            );
+
+            if (result.DeletedCount == 0)
+            {
+                return NotFound(new { message = "Notification not found or not owned by user" });
+            }
+
+            return Ok(new { message = "Notification deleted successfully" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Failed to delete notification {notificationId}");
+            return StatusCode(500, new { message = "Failed to delete notification" });
+        }
+    }
+
+    /// <summary>
+    /// Delete all notifications for a user
+    /// </summary>
+    [HttpDelete("{userId}/all")]
+    public async Task<IActionResult> DeleteAllNotifications(string userId)
+    {
+        try
+        {
+            if (!_context.IsConnected || _context.Notifications == null)
+            {
+                return StatusCode(503, new { message = "Database temporarily unavailable" });
+            }
+
+            var result = await _context.Notifications.DeleteManyAsync(
+                n => n.TargetUserId == userId
+            );
+
+            return Ok(new { message = $"{result.DeletedCount} notifications deleted" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Failed to delete all notifications for user {userId}");
+            return StatusCode(500, new { message = "Failed to delete notifications" });
+        }
+    }
 }
 
 public class MarkNotificationDto
