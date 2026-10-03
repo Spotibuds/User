@@ -5,6 +5,8 @@ namespace User.Entities;
 
 public class Chat : BaseEntity
 {
+    [BsonIgnoreIfNull]
+    public string? DirectKey { get; set; }
     [BsonElement("participants")]
     public List<string> Participants { get; set; } = new();
 
@@ -19,4 +21,4 @@ public class Chat : BaseEntity
 
     [BsonElement("lastActivity")]
     public DateTime LastActivity { get; set; } = DateTime.UtcNow;
-} 
+}

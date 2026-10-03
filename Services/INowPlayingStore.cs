@@ -38,7 +38,7 @@ public class NowPlayingStore : INowPlayingStore
 		state.UpdatedAt = DateTime.UtcNow;
 		_cache.Set(KeyOf(state.IdentityUserId), state, new MemoryCacheEntryOptions
 		{
-			AbsoluteExpirationRelativeToNow = ttl
+			AbsoluteExpirationRelativeToNow = ttl, Size = 1
 		});
 	}
 
@@ -64,5 +64,3 @@ public class NowPlayingStore : INowPlayingStore
 		_cache.Remove(KeyOf(identityUserId));
 	}
 }
-
-

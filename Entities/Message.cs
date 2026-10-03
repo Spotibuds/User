@@ -5,6 +5,7 @@ namespace User.Entities;
 
 public class Message : BaseEntity
 {
+    public string ClientMessageId { get; set; } = Guid.NewGuid().ToString();
     [BsonElement("chatId")]
     public string ChatId { get; set; } = string.Empty;
 
@@ -49,4 +50,4 @@ public enum MessageType
     Audio = 2,
     File = 3,
     System = 4
-} 
+}

@@ -1,20 +1,13 @@
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
-WORKDIR /app
-EXPOSE 80
-EXPOSE 8081
-
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0.401 AS build
 WORKDIR /src
-COPY ["User.csproj", "."]
-RUN dotnet restore "User.csproj"
+COPY User.csproj packages.lock.json ./
+RUN dotnet restore User.csproj --locked-mode
 COPY . .
-WORKDIR "/src"
-RUN dotnet build "User.csproj" -c Release -o /app/build
-
-FROM build AS publish
-RUN dotnet publish "User.csproj" -c Release -o /app/publish /p:UseAppHost=false
-
-FROM base AS final
+RUN dotnet publish User.csproj -c Release -o /out --no-restore
+FROM mcr.microsoft.com/dotnet/aspnet:10.0.12
 WORKDIR /app
-COPY --from=publish /app/publish .
-ENTRYPOINT ["dotnet", "User.dll"] 
+COPY --from=build /out ./
+USER $APP_UID
+EXPOSE 8080
+ENV ASPNETCORE_URLS=http://+:8080
+ENTRYPOINT ["dotnet", "User.dll"]

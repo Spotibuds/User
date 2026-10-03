@@ -1,80 +1,19 @@
-using System.Collections.Concurrent;
-
 namespace User.Services;
-
-/// <summary>
-/// Service to track which users are currently viewing which chats
-/// </summary>
 public interface IActiveChatTrackingService
 {
-    void AddUserToChat(string chatId, string userId);
-    void RemoveUserFromChat(string chatId, string userId);
-    void RemoveUserFromAllChats(string userId);
+    void AddUserToChat(string chatId, string userId, string connectionId);
+    void RemoveUserFromChat(string chatId, string userId, string connectionId);
+    void RemoveUserFromAllChats(string userId, string connectionId);
     bool IsUserInChat(string chatId, string userId);
     HashSet<string> GetUsersInChat(string chatId);
 }
-
-public class ActiveChatTrackingService : IActiveChatTrackingService
+public sealed class ActiveChatTrackingService : IActiveChatTrackingService
 {
-    // Thread-safe dictionary to track active chat users
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, bool>> _activeChatUsers = new();
-
-    public void AddUserToChat(string chatId, string userId)
-    {
-        _activeChatUsers.AddOrUpdate(
-            chatId,
-            new ConcurrentDictionary<string, bool> { [userId] = true },
-            (key, existing) =>
-            {
-                existing[userId] = true;
-                return existing;
-            }
-        );
-    }
-
-    public void RemoveUserFromChat(string chatId, string userId)
-    {
-        if (_activeChatUsers.TryGetValue(chatId, out var users))
-        {
-            users.TryRemove(userId, out _);
-            
-            // Clean up empty chat entries
-            if (users.IsEmpty)
-            {
-                _activeChatUsers.TryRemove(chatId, out _);
-            }
-        }
-    }
-
-    public void RemoveUserFromAllChats(string userId)
-    {
-        var chatsToRemove = new List<string>();
-        
-        foreach (var kvp in _activeChatUsers)
-        {
-            if (kvp.Value.TryRemove(userId, out _) && kvp.Value.IsEmpty)
-            {
-                chatsToRemove.Add(kvp.Key);
-            }
-        }
-        
-        foreach (var chatId in chatsToRemove)
-        {
-            _activeChatUsers.TryRemove(chatId, out _);
-        }
-    }
-
-    public bool IsUserInChat(string chatId, string userId)
-    {
-        return _activeChatUsers.TryGetValue(chatId, out var users) && users.ContainsKey(userId);
-    }
-
-    public HashSet<string> GetUsersInChat(string chatId)
-    {
-        if (_activeChatUsers.TryGetValue(chatId, out var users))
-        {
-            return new HashSet<string>(users.Keys);
-        }
-        return new HashSet<string>();
-    }
+    private readonly object gate = new();
+    private readonly Dictionary<string, Dictionary<string, HashSet<string>>> chats = new();
+    public void AddUserToChat(string chatId, string userId, string connectionId) { lock (gate) { if (!chats.TryGetValue(chatId, out var users)) chats[chatId] = users = new(); if (!users.TryGetValue(userId, out var set)) users[userId] = set = []; set.Add(connectionId); } }
+    public void RemoveUserFromChat(string chatId, string userId, string connectionId) { lock (gate) { if (!chats.TryGetValue(chatId, out var users) || !users.TryGetValue(userId, out var set)) return; set.Remove(connectionId); if (set.Count == 0) users.Remove(userId); if (users.Count == 0) chats.Remove(chatId); } }
+    public void RemoveUserFromAllChats(string userId, string connectionId) { lock (gate) foreach (var chatId in chats.Keys.ToList()) RemoveUserFromChat(chatId, userId, connectionId); }
+    public bool IsUserInChat(string chatId, string userId) { lock (gate) return chats.TryGetValue(chatId, out var users) && users.ContainsKey(userId); }
+    public HashSet<string> GetUsersInChat(string chatId) { lock (gate) return chats.TryGetValue(chatId, out var users) ? new(users.Keys) : []; }
 }

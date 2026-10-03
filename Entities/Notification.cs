@@ -22,6 +22,8 @@ public enum NotificationStatus
 
 public class Notification : BaseEntity
 {
+    [BsonIgnoreIfNull]
+    public string? Key { get; set; }
     /// <summary>
     /// The user who will receive this notification
     /// </summary>

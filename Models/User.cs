@@ -6,6 +6,7 @@ namespace User.Models;
 [BsonIgnoreExtraElements]
 public class User
 {
+    public List<string> Roles { get; set; } = new();
     [BsonId]
     [BsonRepresentation(BsonType.ObjectId)]
     public string Id { get; set; } = ObjectId.GenerateNewId().ToString();

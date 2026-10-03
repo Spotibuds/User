@@ -1,0 +1,531 @@
+{
+  "repository": "User",
+  "updated": "2026-10-03",
+  "verification": {
+    "build": "Release build zero warnings/errors",
+    "tests": "Committed actual Mongo/JWT/SignalR/Azurite tests; final result in shared verification report",
+    "liveStack": "Identity/account and outage/restart checks recorded in Frontend/docs/local-demo"
+  },
+  "entries": [
+    {
+      "id": "IU-03",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Removed public creation/reset and restricted profile writes to claim owner; admin deletion delegates the coordinated Identity workflow.",
+      "changedFiles": [
+        "Controllers/UsersController.cs",
+        "Services/ApiSafety.cs"
+      ],
+      "verification": [
+        "Real JWT/Mongo anonymous and foreign write denials assert unchanged persisted profile/history."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-04",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Removed the destructive development friendship reset route.",
+      "changedFiles": [
+        "Controllers/FriendsController.cs"
+      ],
+      "verification": [
+        "Committed real middleware test calls former reset route and verifies seeded friendship survives."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-05",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "All social and notification actors/recipients derive from validated claims; normalized follow edge is authoritative.",
+      "changedFiles": [
+        "Controllers/FriendsController.cs",
+        "Controllers/FollowsController.cs",
+        "Controllers/NotificationsController.cs",
+        "Services/SocialCommands.cs"
+      ],
+      "verification": [
+        "Concurrent forged follow actor requests keep one actual-actor edge; foreign notification actions denied."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-06",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Central privacy policy covers direct profile/avatar/history, graph and batch/feed reads; unrelated private batch results are minimal summaries.",
+      "changedFiles": [
+        "Services/ApiSafety.cs",
+        "Controllers/UsersController.cs",
+        "Controllers/FollowsController.cs",
+        "Controllers/FriendsController.cs",
+        "Controllers/FeedController.cs"
+      ],
+      "verification": [
+        "Anonymous/unrelated/self/Admin real Mongo privacy matrix; actual private avatar bytes denial."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-07",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Feed and reaction actor fields are overwritten from claims; catalogue metadata comes from the canonical Music response.",
+      "changedFiles": [
+        "Controllers/FeedController.cs",
+        "Services/CanonicalSongReader.cs"
+      ],
+      "verification": [
+        "Persisted forged feed/reaction actor regression; canonical/unknown catalogue and no-side-effect tests."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-08",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Removed callable server-only notification delivery methods from authenticated hub.",
+      "changedFiles": [
+        "Hubs/NotificationHub.cs"
+      ],
+      "verification": [
+        "Actual SignalR invocation of removed helper fails and creates no forged notification."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-09",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Chat creation requires caller membership and valid distinct profiles; private recipients require accepted friendship; reads/sends/receipts check membership.",
+      "changedFiles": [
+        "Services/ChatCommands.cs",
+        "Controllers/ChatsController.cs",
+        "Hubs/ChatHub.cs"
+      ],
+      "verification": [
+        "Real JWT/Mongo third-party chat creation/read/send denials and canonical chat/message state assertions."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-11",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Each HTTP request and hub invocation validates durable Identity sid; expired hub authentication closes connections.",
+      "changedFiles": [
+        "Program.cs",
+        "Services/ApiSafety.cs"
+      ],
+      "verification": [
+        "Real JWT expiry/sid rejection and actual hub revocation; full-stack immediate logout/password/role revocation."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-13",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Profiles use a unique Identity GUID index shared with Identity and trusted idempotent reconciliation.",
+      "changedFiles": [
+        "Services/IndexInitializer.cs",
+        "Controllers/UsersController.cs"
+      ],
+      "verification": [
+        "Live missing-profile recovery and repeated repair leave one canonical profile; repeated seed checks uniqueness."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-14",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Identity owns username/privacy/roles; User presentation edits preserve absent fields, allow clear, and fail when authority sync is incomplete.",
+      "changedFiles": [
+        "Controllers/UsersController.cs"
+      ],
+      "verification": [
+        "Live authoritative role/privacy concurrency and persisted profile clear/validation checks."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-15",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Internal cleanup is idempotent, calls Music owner cleanup, clears GUID relations and bounded chat batches, and deletes profile last.",
+      "changedFiles": [
+        "Controllers/UsersController.cs",
+        "Services/MongoTransactions.cs"
+      ],
+      "verification": [
+        "Full-stack deletion asserts PostgreSQL/Mongo cleanup and retains pending outbox on service failure."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-16",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Trusted internal service authentication and typed JSON contracts replace incompatible anonymous repair.",
+      "changedFiles": [
+        "Controllers/UsersController.cs",
+        "Program.cs"
+      ],
+      "verification": [
+        "Live missing-profile repair and canonical username/role/privacy checks."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-17",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Reusable non-null Mongo client with bounded connection/socket timeouts; no constructor health gate.",
+      "changedFiles": [
+        "Program.cs",
+        "Data/MongoDbContext.cs"
+      ],
+      "verification": [
+        "Mongo outage returns503; recovery retains API containers and reconnects to persisted data."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-18",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Removed token/chat-content logs and obsolete insecure hub; request framework logs are Warning.",
+      "changedFiles": [
+        "Hubs/FriendHub.cs",
+        "Hubs/ChatHub.cs",
+        "appsettings.json"
+      ],
+      "verification": [
+        "Source/logging review and live hub tests without credential/content output."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-19",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Removed public debug/connection-string diagnostics; health emits only readiness state.",
+      "changedFiles": [
+        "Controllers/DebugController.cs (removed)",
+        "Program.cs"
+      ],
+      "verification": [
+        "Real health/live/ready responses and unavailable dependency checks; no public debug route."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-20",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Structured ApiProblem produces403 instead of passing a message as an authentication scheme.",
+      "changedFiles": [
+        "Services/ApiSafety.cs",
+        "Services/ChatCommands.cs"
+      ],
+      "verification": [
+        "Nonmember chat operations return403 with unchanged message count."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-21",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Reaction migration uses the persisted feed upsert ID and merges duplicate legacy reactions in the same history transaction.",
+      "changedFiles": [
+        "Services/HistoryService.cs",
+        "Controllers/FeedController.cs"
+      ],
+      "verification": [
+        "Persisted now-playing/recent-song reaction migration and stable post-ID checks."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-22",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "History is separate indexed events retained90days; weekly aggregates use half-open UTC Sunday windows and current events, including more than100 plays.",
+      "changedFiles": [
+        "Services/HistoryService.cs",
+        "Controllers/FeedController.cs",
+        "Entities/HistoryEvent.cs"
+      ],
+      "verification": [
+        "105 persisted API history events and page tail; controlled week boundaries and batched top-three public feed."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-23",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Presence and active chat count individual connection IDs and remove only the departing tab.",
+      "changedFiles": [
+        "Services/PresenceStore.cs",
+        "Services/ActiveChatTrackingService.cs",
+        "Hubs/FriendHub.cs",
+        "Hubs/ChatHub.cs"
+      ],
+      "verification": [
+        "Multi-connection presence/active membership regression; actual hub connections and delivery."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-24",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "REST and both hubs share message commands, projection, broadcasts, idempotent notifications and canonical acknowledgements.",
+      "changedFiles": [
+        "Services/ChatCommands.cs",
+        "Controllers/ChatsController.cs",
+        "Hubs/ChatHub.cs",
+        "Hubs/FriendHub.cs"
+      ],
+      "verification": [
+        "Actual REST plus LongPolling SignalR sends converge on canonical message IDs and receipts."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-25",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Unique indexes plus bounded snapshot transactions protect follow/friend/chat/message/feed state; receipts use conditional atomic pushes.",
+      "changedFiles": [
+        "Services/IndexInitializer.cs",
+        "Services/MongoTransactions.cs",
+        "Services/SocialCommands.cs",
+        "Services/ChatCommands.cs"
+      ],
+      "verification": [
+        "Real concurrent follow/message/receipt assertions and transaction rollback test."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-26",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Bounded pagination, batch participant/last-message lookups, graph-free list DTOs and indexed author-batch feed aggregates replace unlimited scans and serial N+1 queries.",
+      "changedFiles": [
+        "Services/IndexInitializer.cs",
+        "Controllers/FeedController.cs",
+        "Controllers/UsersController.cs",
+        "Services/HistoryService.cs",
+        "Services/ChatCommands.cs",
+        "Controllers/ChatsController.cs"
+      ],
+      "verification": [
+        "Invalid page limits rejected; history page tail and batched public-author top-three correctness."
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Production-scale load testing remains a follow-up."
+      ]
+    },
+    {
+      "id": "IU-27",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Decode actual bytes with MIT Skia, reject incomplete/oversized images, normalize PNG, upload before CAS metadata publication, and persist cleanup intents.",
+      "changedFiles": [
+        "Services/AzureBlobService.cs",
+        "Services/AvatarMaintenance.cs",
+        "Controllers/UsersController.cs"
+      ],
+      "verification": [
+        "Real Azurite avatar upload/MIME/privacy, spoof/truncation/size/dimension denials, replacement and two-upload CAS cleanup."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-28",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Notifications publish persisted IDs and string types/status; owner mutations preserve Handled, expiry counts agree, and transactional commands use idempotent keys.",
+      "changedFiles": [
+        "Services/NotificationService.cs",
+        "Hubs/NotificationHub.cs",
+        "Services/SocialCommands.cs"
+      ],
+      "verification": [
+        "Persisted terminal friend request, notification owner and actual hub canonical ID regressions."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-29",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Removed token parser diagnostics; only validated signed JWT authentication establishes identity.",
+      "changedFiles": [
+        "Services/ApiSafety.cs",
+        "Program.cs"
+      ],
+      "verification": [
+        "Actual bad signature/issuer/audience/expired/missing-sid rejection, persisted state unchanged."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-R01",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Documented single-instance realtime/presence/now-playing state; distributed delivery is a production follow-up.",
+      "changedFiles": [
+        "docs/LOCAL-DEMO.md"
+      ],
+      "verification": [
+        "Local multi-tab behavior tested; no multi-replica guarantee claimed."
+      ],
+      "status": "Deferred: production-only follow-up",
+      "limitations": [
+        "Distributed coordination/backplane and durable cross-instance event routing remain unverified."
+      ]
+    },
+    {
+      "id": "IU-R02",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Removed dormant RabbitMQ consumer/helpers instead of implying broker delivery; shared synchronous commands persist messages/notifications.",
+      "changedFiles": [
+        "Services/RabbitMqService.cs (removed)",
+        "RabbitMQ (removed)",
+        "docs/LOCAL-DEMO.md"
+      ],
+      "verification": [
+        "Source service registrations and actual REST/hub persisted delivery checks."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-R04",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Committed actual authorization/Mongo/SignalR/storage regressions and validation-only CI with fresh disposable dependencies.",
+      "changedFiles": [
+        "tests/User.Tests",
+        "User.csproj",
+        ".github/workflows/ci-cd.yml"
+      ],
+      "verification": [
+        "Full persisted suite run locally; remote CI not triggered."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-R06",
+      "applicability": "Original audit reproduced or confirmed in initial source; local correction implemented.",
+      "correction": "Removed unused public-container avatar helper; current avatar container creation is private and proxy policy enforced.",
+      "changedFiles": [
+        "Services/AzureBlobService.cs"
+      ],
+      "verification": [
+        "Real anonymous private-avatar denial and container creation policy review."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "NEW-U01",
+      "title": "A release-only image-library license gate blocked the User container build.",
+      "applicability": "Encountered and corrected during this task.",
+      "correction": "Replaced ImageSharp with current MIT SkiaSharp plus Linux native assets; strict decoded-content validation.",
+      "changedFiles": [
+        "User.csproj",
+        "Services/AzureBlobService.cs"
+      ],
+      "verification": [
+        "Release/native/Docker builds passed; actual adversarial avatar regressions."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "NEW-U02",
+      "title": "Message/social/history writes could commit only one projection on interruption.",
+      "applicability": "Encountered and corrected during this task.",
+      "correction": "Added bounded snapshot transactions for authoritative documents, notifications and projections.",
+      "changedFiles": [
+        "Services/MongoTransactions.cs",
+        "Services/ChatCommands.cs",
+        "Services/SocialCommands.cs",
+        "Services/HistoryService.cs"
+      ],
+      "verification": [
+        "Real Mongo rollback and convergent canonical state tests."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "NEW-U03",
+      "title": "Wrong JSON types in a profile patch could trigger500.",
+      "applicability": "Encountered and corrected during this task.",
+      "correction": "Explicitly validate object/string/null/boolean kinds before any writes.",
+      "changedFiles": [
+        "Controllers/UsersController.cs"
+      ],
+      "verification": [
+        "Malformed profile patch regression returns400 with unchanged stored values."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "NEW-U04",
+      "title": "Avatar publication could succeed after profile removal or concurrent replacement.",
+      "applicability": "Encountered and corrected during this task.",
+      "correction": "Require CAS matched count before publication; delete losing upload and retain durable cleanup intent.",
+      "changedFiles": [
+        "Controllers/UsersController.cs",
+        "Services/AzureBlobService.cs"
+      ],
+      "verification": [
+        "Two real concurrent avatar uploads produce one winner and clean losing blob."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "NEW-U05",
+      "title": "Client playback metadata could invent songs and poison artist aggregates.",
+      "applicability": "Encountered and corrected during this task.",
+      "correction": "Validate existence and use canonical title/artists/cover/duration from Music.",
+      "changedFiles": [
+        "Services/CanonicalSongReader.cs",
+        "Services/HistoryService.cs",
+        "Controllers/FeedController.cs"
+      ],
+      "verification": [
+        "Forged/unknown/overduration/catalogue outage no-side-effect regressions."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "NEW-U06",
+      "title": "Reloading live playback reactions queried an ephemeral ID instead of the durable post.",
+      "applicability": "Encountered during actual browser acceptance and server contract review.",
+      "correction": "Resolve validated now-playing read IDs to the existing persisted recent-song post without creating data on reads.",
+      "changedFiles": [
+        "Controllers/FeedController.cs",
+        "tests/User.Tests/AdditionalIntegrityTests.cs"
+      ],
+      "verification": [
+        "Persisted regression checks empty reads have no side effects, live and saved post reads return the same reaction, and playback expiration preserves durable reactions.",
+        "Final documented full command passed all19 User tests and all21 browser workflows; the real feed case asserts the canonical post identity and reaction persistence through live-card reload and history transition."
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    }
+  ]
+}

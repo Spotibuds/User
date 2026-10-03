@@ -1,0 +1,15 @@
+# User service local contracts
+
+See the sibling Frontend `demo/README.md` for the complete isolated setup and commands. This API requires .NET 10, a Mongo replica set, an explicit shared JWT issuer/audience/signing key, exact CORS origin, internal service secret, Identity and Music base URLs, and a private Blob account. Missing mandatory configuration fails startup clearly.
+
+The default authorization policy requires a signed, unexpired JWT. Internal operations require a separate service secret; they are not public profile CRUD. Authenticated HTTP requests and hub commands verify the durable Identity session. Self writes use the claim actor; third-party private reads return 403. Minimal private search/batch summaries contain no biography, avatar or social data.
+
+The four Mongo ID/Identity GUID boundaries are explicit: profiles, chats, friendships and messages have Mongo ObjectIds; authenticated actors are Identity GUIDs. Unique indexes protect profile GUIDs, friendship pairs, direct-chat pairs, normalized follow edges, message client IDs, feed keys, notification keys and reactions. Social transitions and message/history projections use snapshot transactions with a ten-second retry budget and three-second maximum commit time. REST and SignalR use the same commands and canonical persisted DTOs.
+
+Presence and active-chat membership count individual connections, so closing one tab preserves another tab's presence. Live message broadcasts are independent of notification suppression. SignalR closes expired authentication connections and validates revocation per invocation. Stored messages and notifications can be recovered by list endpoints after interrupted live delivery.
+
+Listening history is stored as indexed individual events for 90 days. UTC Sunday windows are tested with a controlled clock and half-open interval. Avatars are decoded with MIT-licensed SkiaSharp, bounded to 5 MiB/4096 pixels/16 million decoded pixels, normalized to PNG, and served by a privacy-aware proxy. Upload publishes new metadata only after storage succeeds; durable intents clean old or abandoned uploads using bounded background work. No public container ACL or persisted SAS is required.
+
+`dotnet test tests/User.Tests/User.Tests.csproj -c Release` requires `USER_TEST_MONGO` pointing to an explicitly disposable Mongo replica set; the factory creates and drops only its own `spotibuds_test_*` databases. Tests exercise real JWT middleware, persisted Mongo state and actual SignalR LongPolling calls. Test-only Identity responses replace the named internal HTTP client, not authorization middleware or database state. Run the complete-stack scripts to verify real cross-service sessions, storage failures and restart persistence.
+
+The removed public debug/reset/JWT parser and dormant RabbitMQ/helper paths are intentionally unavailable. Weekly calculations run from durable history on reads. User remains single-instance for presence/live routing; scaling, durable distributed event delivery, external email verification and production recovery are separate follow-ups.

@@ -5,6 +5,7 @@ namespace User.Entities;
 
 public class Friend : BaseEntity
 {
+    public string PairKey { get; set; } = string.Empty;
     [BsonElement("userId")]
     public string UserId { get; set; } = string.Empty;
 
@@ -27,4 +28,4 @@ public enum FriendStatus
     Accepted = 1,
     Blocked = 2,
     Declined = 3
-} 
+}

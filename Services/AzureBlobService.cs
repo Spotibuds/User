@@ -1,147 +1,66 @@
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
-using Azure.Storage.Sas;
+using SkiaSharp;
+using MongoDB.Driver;
+using User.Data;
+using User.Entities;
 
 namespace User.Services;
-
 public interface IAzureBlobService
 {
     Task<string> UploadUserProfilePictureAsync(string userId, Stream imageStream, string fileName);
-    Task<Stream> DownloadFileAsync(string containerName, string blobName);
-    Task<bool> DeleteFileAsync(string containerName, string blobName);
-    Task<List<string>> ListFilesAsync(string containerName, string prefix = "");
-    BlobContainerClient GetBlobContainerClient(string containerName);
-    string GenerateSasUrl(string containerName, string blobName, TimeSpan? expiry = null);
-    Task UpdateContainerAccessLevelAsync(string containerName);
+    Task<Stream> DownloadAvatar(string userId, string filename);
+    Task Cleanup(string url);
+    Task Published(string url);
+    Task Delete(string url);
+    Task Ready(CancellationToken ct);
 }
-
-public class AzureBlobService : IAzureBlobService
+public sealed class AzureBlobService : IAzureBlobService
 {
-    private readonly BlobServiceClient _blobServiceClient;
-    private readonly string _usersContainer;
-
-    public AzureBlobService(IConfiguration configuration)
-    {
-        var connectionString = configuration["AzureStorage:ConnectionString"];
-        if (string.IsNullOrEmpty(connectionString))
-        {
-            throw new ArgumentException("Azure Storage connection string not found");
-        }
-
-        _blobServiceClient = new BlobServiceClient(connectionString);
-        _usersContainer = configuration["AzureStorage:UsersContainer"] ?? "users";
-    }
-
+    private readonly BlobContainerClient container;
+    private readonly string publicUrl;
+    private readonly MongoDbContext db;
+    private readonly TimeProvider clock;
+    public AzureBlobService(IConfiguration config, MongoDbContext context, TimeProvider time) { db = context; clock = time; var options = new BlobClientOptions(); options.Retry.MaxRetries = 2; options.Retry.NetworkTimeout = TimeSpan.FromSeconds(5); container = new BlobServiceClient(config["AzureStorage:ConnectionString"], options).GetBlobContainerClient("avatars"); publicUrl = (config["AzureStorage:PublicBaseUrl"] ?? throw new InvalidOperationException("AzureStorage:PublicBaseUrl required")).TrimEnd('/'); }
+    public async Task Ready(CancellationToken ct) => await container.CreateIfNotExistsAsync(PublicAccessType.None, cancellationToken: ct);
     public async Task<string> UploadUserProfilePictureAsync(string userId, Stream imageStream, string fileName)
     {
-        var containerClient = _blobServiceClient.GetBlobContainerClient(_usersContainer);
-        await containerClient.CreateIfNotExistsAsync(PublicAccessType.None);
-
-        var imageGuid = Guid.NewGuid().ToString();
-        var fileExtension = Path.GetExtension(fileName).ToLower();
-        var blobName = $"{userId}/profile_pic/{imageGuid}{fileExtension}";
-
-        var blobClient = containerClient.GetBlobClient(blobName);
-        await blobClient.UploadAsync(imageStream, overwrite: true);
-
-        return GenerateSasUrl(_usersContainer, blobName, TimeSpan.FromDays(365));
-    }
-
-    public async Task<Stream> DownloadFileAsync(string containerName, string blobName)
-    {
-        var containerClient = _blobServiceClient.GetBlobContainerClient(containerName);
-        var blobClient = containerClient.GetBlobClient(blobName);
-
-        var response = await blobClient.DownloadStreamingAsync();
-        return response.Value.Content;
-    }
-
-    public async Task<bool> DeleteFileAsync(string containerName, string blobName)
-    {
-        var containerClient = _blobServiceClient.GetBlobContainerClient(containerName);
-        var blobClient = containerClient.GetBlobClient(blobName);
-
-        var response = await blobClient.DeleteIfExistsAsync();
-        return response.Value;
-    }
-
-    public async Task<List<string>> ListFilesAsync(string containerName, string prefix = "")
-    {
-        var containerClient = _blobServiceClient.GetBlobContainerClient(containerName);
-        var blobs = new List<string>();
-
-        await foreach (var blobItem in containerClient.GetBlobsAsync(prefix: prefix))
+        Input.GuidId(userId); using (imageStream) using (var bytes = new MemoryStream())
         {
-            blobs.Add(blobItem.Name);
-        }
-
-        return blobs;
-    }
-
-    public BlobContainerClient GetBlobContainerClient(string containerName)
-    {
-        return _blobServiceClient.GetBlobContainerClient(containerName);
-    }
-
-    public string GenerateSasUrl(string containerName, string blobName, TimeSpan? expiry = null)
-    {
-        try
-        {
-            var containerClient = _blobServiceClient.GetBlobContainerClient(containerName);
-            var blobClient = containerClient.GetBlobClient(blobName);
-
-            // Check if we can generate SAS (requires account key)
-            if (!blobClient.CanGenerateSasUri)
+            var buffer = new byte[81920]; int read;
+            while ((read = await imageStream.ReadAsync(buffer)) > 0) { if (bytes.Length + read > 5 * 1024 * 1024) throw new ApiProblem(400, "Avatar exceeds 5 MiB."); await bytes.WriteAsync(buffer.AsMemory(0, read)); }
+            bytes.Position = 0;
+            try
             {
-                Console.WriteLine($"ERROR: Cannot generate SAS URI for {containerName}/{blobName}. The connection string may not include the account key.");
-                Console.WriteLine($"Connection string format needed: DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net");
-                throw new InvalidOperationException($"Cannot generate SAS URI. This usually means the connection string doesn't include the account key, or managed identity is being used without proper SAS delegation.");
+                using var encoded = SKData.CreateCopy(bytes.ToArray());
+                using var codec = SKCodec.Create(encoded) ?? throw new ApiProblem(400, "Invalid image content.");
+                if (codec.EncodedFormat is not (SKEncodedImageFormat.Png or SKEncodedImageFormat.Jpeg or SKEncodedImageFormat.Webp or SKEncodedImageFormat.Gif)) throw new ApiProblem(400, "Use PNG, JPEG, WebP or GIF.");
+                if (codec.Info.Width > 4096 || codec.Info.Height > 4096 || (long)codec.Info.Width * codec.Info.Height > 16000000) throw new ApiProblem(400, "Avatar dimensions are too large.");
+                using var image = new SKBitmap(codec.Info);
+                if (codec.GetPixels(image.Info, image.GetPixels()) != SKCodecResult.Success) throw new ApiProblem(400, "Invalid or incomplete image content.");
+                using var png = image.Encode(SKEncodedImageFormat.Png, 90);
+                using var normalized = new MemoryStream(png.ToArray());
+                var name = $"{Guid.NewGuid():N}.png";
+                var url = $"{publicUrl}/api/users/avatar/{userId}/{name}";
+                await db.AvatarCleanup.InsertOneAsync(new AvatarCleanupIntent { Url = url, DueAt = clock.GetUtcNow().UtcDateTime.AddHours(1) });
+                await container.CreateIfNotExistsAsync(PublicAccessType.None);
+                await container.GetBlobClient($"{userId}/{name}").UploadAsync(normalized, new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = "image/png", CacheControl = "private, max-age=60" } });
+                return url;
             }
-
-            var sasBuilder = new BlobSasBuilder
-            {
-                BlobContainerName = containerName,
-                BlobName = blobName,
-                Resource = "b", // blob resource
-                ExpiresOn = DateTimeOffset.UtcNow.Add(expiry ?? TimeSpan.FromDays(365)) // Long-lived for media files
-            };
-
-            sasBuilder.SetPermissions(BlobSasPermissions.Read);
-
-            var sasUrl = blobClient.GenerateSasUri(sasBuilder).ToString();
-            Console.WriteLine($"Generated SAS URL for {containerName}/{blobName}");
-            return sasUrl;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error generating SAS URL for {containerName}/{blobName}: {ex.Message}");
-            throw; // Re-throw the exception since we can't fallback to direct URLs with private containers
+            catch (ArgumentException) { throw new ApiProblem(400, "Upload a valid PNG, JPEG, GIF or WebP image."); }
         }
     }
-
-    public async Task UpdateContainerAccessLevelAsync(string containerName)
+    public async Task<Stream> DownloadAvatar(string userId, string filename) { Input.GuidId(userId); if (!System.Text.RegularExpressions.Regex.IsMatch(filename, "^[a-f0-9]{32}\\.png$")) throw new ApiProblem(400, "Invalid avatar path."); return (await container.GetBlobClient($"{userId}/{filename}").DownloadStreamingAsync()).Value.Content; }
+    public async Task Cleanup(string url)
     {
-        try
-        {
-            var containerClient = _blobServiceClient.GetBlobContainerClient(containerName);
-            
-            // Check if container exists
-            var exists = await containerClient.ExistsAsync();
-            if (!exists.Value)
-            {
-                Console.WriteLine($"Container {containerName} does not exist, creating with public blob access");
-                await containerClient.CreateIfNotExistsAsync(PublicAccessType.Blob);
-                return;
-            }
-
-            // Update existing container to allow public blob access
-            await containerClient.SetAccessPolicyAsync(PublicAccessType.Blob);
-            Console.WriteLine($"Updated container {containerName} to allow public blob access");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error updating container access level for {containerName}: {ex.Message}");
-            throw;
-        }
+        await db.AvatarCleanup.UpdateOneAsync(x => x.Url == url, Builders<AvatarCleanupIntent>.Update.SetOnInsert(x => x.Url, url).Set(x => x.DueAt, clock.GetUtcNow().UtcDateTime), new UpdateOptions { IsUpsert = true });
+        try { await Delete(url); await Published(url); } catch (Exception ex) when (DependencyErrors.IsDependency(ex)) { /* Durable intent retains the cleanup; metadata replacement has already succeeded. */ }
+    }
+    public async Task Published(string url) => await db.AvatarCleanup.DeleteManyAsync(x => x.Url == url);
+    public async Task Delete(string url)
+    {
+        var prefix = publicUrl + "/api/users/avatar/"; if (!url.StartsWith(prefix, StringComparison.Ordinal)) return;
+        var path = url[prefix.Length..]; var parts = path.Split('/'); if (parts.Length != 2 || !Guid.TryParse(parts[0], out _) || !System.Text.RegularExpressions.Regex.IsMatch(parts[1], "^[a-f0-9]{32}\\.png$")) throw new ApiProblem(400, "Invalid avatar path.");
+        await container.GetBlobClient(path).DeleteIfExistsAsync();
     }
 }

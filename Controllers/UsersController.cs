@@ -1,1258 +1,150 @@
+using System.Text.Json;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using MongoDB.Driver;
 using User.Data;
+using User.Entities;
 using User.Models;
-using Microsoft.Extensions.Hosting;
 using User.Services;
-
 namespace User.Controllers;
-
-[ApiController]
-[Route("api/[controller]")]
-public class UsersController : ControllerBase
+[ApiController, Route("api/users")]
+public class UsersController(MongoDbContext db, ProfilePolicy profiles, IHttpClientFactory clients, IAzureBlobService blobs, HistoryService history, IConfiguration config, MongoTransactions transactions) : ControllerBase
 {
-    private readonly MongoDbContext _context;
-    private readonly IAzureBlobService _azureBlobService;
-
-    public UsersController(MongoDbContext context, IAzureBlobService azureBlobService)
+    [HttpGet("health"), AllowAnonymous] public object Health() => new { status = "alive", readiness = "/health/ready" };
+    private async Task<object> Dto(Models.User user, bool summary = false, bool includeGraph = true)
     {
-        _context = context;
-        _azureBlobService = azureBlobService;
+        var following = summary || !includeGraph ? [] : await db.Follows.Find(x => x.FollowerId == user.IdentityUserId).Limit(100).ToListAsync();
+        var followers = summary || !includeGraph ? [] : await db.Follows.Find(x => x.FollowedId == user.IdentityUserId).Limit(100).ToListAsync();
+        var followedIds = following.Select(x => x.FollowedId).ToList(); var followerIds = followers.Select(x => x.FollowerId).ToList();
+        var related = summary || !includeGraph ? [] : await db.Users.Find(x => followedIds.Contains(x.IdentityUserId) || followerIds.Contains(x.IdentityUserId)).Limit(200).ToListAsync();
+        return new { user.Id, user.IdentityUserId, user.UserName, displayName = summary ? null : user.DisplayName, bio = summary ? null : user.Bio, avatarUrl = summary ? null : user.AvatarUrl, user.IsPrivate, playlists = Array.Empty<object>(), followedUsers = related.Where(x => followedIds.Contains(x.IdentityUserId)).Select(x => new { x.Id }), followers = related.Where(x => followerIds.Contains(x.IdentityUserId)).Select(x => new { x.Id }), user.CreatedAt };
     }
-
-    [HttpGet("health")]
-    public ActionResult<string> Health()
-    {
-        return Ok("User service is running!");
-    }
-
-
-
-    [HttpPost("sync-users")]
-    public async Task<ActionResult<string>> SyncUsersFromIdentity()
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            // Get users from Identity service
-            using var httpClient = new HttpClient();
-            httpClient.BaseAddress = new Uri("http://localhost:5000/");
-            
-            var identityUsersResponse = await httpClient.GetAsync("api/auth/users");
-            
-            if (!identityUsersResponse.IsSuccessStatusCode)
-            {
-                var errorContent = await identityUsersResponse.Content.ReadAsStringAsync();
-                return StatusCode(500, $"Failed to get users from Identity service. Status: {identityUsersResponse.StatusCode}");
-            }
-
-            var identityUsersJson = await identityUsersResponse.Content.ReadAsStringAsync();
-
-            // Parse the JSON response from Identity service
-            var identityUsers = System.Text.Json.JsonSerializer.Deserialize<List<IdentityUserDto>>(identityUsersJson);
-            
-            if (identityUsers == null || !identityUsers.Any())
-            {
-                return Ok("No users found in Identity service");
-            }
-
-            // Convert Identity users to User service users
-            var usersToCreate = identityUsers.Select(identityUser => new Models.User
-            {
-                IdentityUserId = identityUser.Id,
-                UserName = identityUser.UserName ?? "Unknown",
-                DisplayName = identityUser.UserName ?? "Unknown",
-                Bio = null,
-                AvatarUrl = null,
-                IsPrivate = identityUser.IsPrivate ?? false,
-                Playlists = new List<PlaylistReference>(),
-                FollowedUsers = new List<UserReference>(),
-                Followers = new List<UserReference>(),
-                CreatedAt = identityUser.CreatedAt ?? DateTime.UtcNow
-            }).ToList();
-
-            var createdCount = 0;
-            var skippedCount = 0;
-
-            foreach (var user in usersToCreate)
-            {
-                try
-                {
-                    // Check if user already exists by IdentityUserId (avoiding the ObjectId issue)
-                    var filter = Builders<Models.User>.Filter.Eq(u => u.IdentityUserId, user.IdentityUserId);
-                    var existingUser = await _context.Users.Find(filter).FirstOrDefaultAsync();
-
-                    if (existingUser == null)
-                    {
-                        // Create new user
-                        await _context.Users.InsertOneAsync(user);
-                        createdCount++;
-                    }
-                    else
-                    {
-                        skippedCount++;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // Log error but continue processing other users
-                }
-            }
-
-            var totalUsers = await _context.Users.CountDocumentsAsync(_ => true);
-            return Ok($"Sync completed! Created {createdCount} new users, skipped {skippedCount} existing users. Total users in database: {totalUsers}");
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error syncing users: {ex.Message}");
-        }
-    }
-
-    [HttpPost("sync-user/{identityUserId}")]
-    public async Task<ActionResult<string>> SyncSpecificUser(string identityUserId)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            // Check if user already exists in MongoDB
-            var existingUser = await _context.Users.Find(u => u.IdentityUserId == identityUserId).FirstOrDefaultAsync();
-            if (existingUser != null)
-            {
-                return Ok($"User {identityUserId} already exists in MongoDB");
-            }
-
-            // Get user from Identity service
-            using var httpClient = new HttpClient();
-            httpClient.BaseAddress = new Uri("http://localhost:5000/");
-            
-            var response = await httpClient.GetAsync($"api/auth/users/{identityUserId}");
-            
-            if (!response.IsSuccessStatusCode)
-            {
-                return StatusCode(500, $"Failed to get user {identityUserId} from Identity service. Status: {response.StatusCode}");
-            }
-
-            var userJson = await response.Content.ReadAsStringAsync();
-            var identityUser = System.Text.Json.JsonSerializer.Deserialize<IdentityUserDto>(userJson);
-            
-            if (identityUser == null)
-            {
-                return StatusCode(500, $"Failed to deserialize user data for {identityUserId}");
-            }
-
-            // Create user in MongoDB
-            var newUser = new Models.User
-            {
-                IdentityUserId = identityUser.Id,
-                UserName = identityUser.UserName ?? "Unknown",
-                DisplayName = identityUser.UserName ?? "Unknown",
-                Bio = null,
-                AvatarUrl = null,
-                IsPrivate = identityUser.IsPrivate ?? false,
-                Playlists = new List<PlaylistReference>(),
-                FollowedUsers = new List<UserReference>(),
-                Followers = new List<UserReference>(),
-                CreatedAt = identityUser.CreatedAt ?? DateTime.UtcNow
-            };
-
-            await _context.Users.InsertOneAsync(newUser);
-            
-            return Ok($"Successfully created user {identityUserId} in MongoDB with MongoDB ID: {newUser.Id}");
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error syncing user {identityUserId}: {ex.Message}");
-        }
-    }
-
+    [HttpGet("all"), Authorize(Roles = "Admin")]
+    public async Task<object> All(int limit = 100, int skip = 0) { Input.Page(limit, skip); var users = await db.Users.Find(_ => true).SortBy(x => x.Id).Skip(skip).Limit(limit).ToListAsync(); return await Task.WhenAll(users.Select(x => Dto(x, false, false))); }
+    [HttpGet("identity/{identityUserId}"), HttpGet("{identityUserId}"), AllowAnonymous]
+    public async Task<object> Get(string identityUserId) => await Dto(await profiles.Read(User, identityUserId, HttpContext.RequestAborted));
     [HttpGet("check/{identityUserId}")]
-    public async Task<ActionResult<object>> CheckUserExists(string identityUserId)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            var user = await _context.Users.Find(u => u.IdentityUserId == identityUserId).FirstOrDefaultAsync();
-            
-            return Ok(new
-            {
-                exists = user != null,
-                userId = identityUserId,
-                mongoId = user?.Id,
-                userName = user?.UserName
-            });
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error checking user {identityUserId}: {ex.Message}");
-        }
-    }
-
-    [HttpGet("all")]
-    public async Task<ActionResult<IEnumerable<UserDto>>> GetUsers()
-    {
-                if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        const int maxRetries = 3;
-        var retryCount = 0;
-
-        while (retryCount < maxRetries)
-        {
-            try
-            {
-                var users = await _context.Users
-                    .Find(_ => true)
-                    .ToListAsync();
-
-                var userDtos = users.Select(u => new UserDto
-                {
-                    Id = u.Id,
-                    IdentityUserId = u.IdentityUserId,
-                    UserName = u.UserName,
-                    DisplayName = u.DisplayName,
-                    Bio = u.Bio,
-                    AvatarUrl = u.AvatarUrl,
-                    Playlists = u.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
-                    FollowedUsers = u.FollowedUsers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-                    Followers = u.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-                    IsPrivate = u.IsPrivate,
-                    CreatedAt = u.CreatedAt
-                }).ToList();
-
-                return Ok(userDtos);
-            }
-            catch (MongoDB.Driver.MongoConnectionException ex)
-            {
-                retryCount++;
-                
-                if (retryCount >= maxRetries)
-                {
-                    return StatusCode(503, "Database connection failed. Please try again later.");
-                }
-                
-                // Wait before retrying
-                await Task.Delay(1000 * retryCount);
-            }
-            catch (System.TimeoutException ex)
-            {
-                retryCount++;
-                
-                if (retryCount >= maxRetries)
-                {
-                    return StatusCode(503, "Database connection failed. Please try again later.");
-                }
-                
-                // Wait before retrying
-                await Task.Delay(1000 * retryCount);
-            }
-            catch (Exception ex)
-            {
-                return StatusCode(500, "Internal server error");
-            }
-        }
-
-        return StatusCode(503, "Database connection failed after multiple attempts. Please try again later.");
-    }
-
-    [HttpGet("identity/{identityUserId}")]
-    public async Task<ActionResult<UserDto>> GetUserByIdentityId(string identityUserId)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            var user = await _context.Users
-                .Find(u => u.IdentityUserId == identityUserId)
-                .FirstOrDefaultAsync();
-
-            if (user == null)
-            {
-                return NotFound($"User with identity ID '{identityUserId}' not found");
-            }
-
-            var userDto = new UserDto
-            {
-                Id = user.Id,
-                IdentityUserId = user.IdentityUserId,
-                UserName = user.UserName,
-                DisplayName = user.DisplayName,
-                Bio = user.Bio,
-                AvatarUrl = user.AvatarUrl,
-                Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
-                FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
-                Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-                IsPrivate = user.IsPrivate,
-                CreatedAt = user.CreatedAt
-            };
-
-            return Ok(userDto);
-        }
-        catch (MongoDB.Driver.MongoConnectionException)
-        {
-            return StatusCode(503, "Database connection failed. Please try again later.");
-        }
-        catch (Exception)
-        {
-            return StatusCode(500, "Internal server error");
-        }
-    }
-
-    [HttpGet("{id}")]
-    public async Task<ActionResult<UserDto>> GetUser(string id)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            // Try to find user by IdentityUserId first, then by MongoDB _id
-            var user = await _context.Users
-                .Find(u => u.IdentityUserId == id)
-                .FirstOrDefaultAsync();
-            
-            if (user == null)
-            {
-                // If not found by IdentityUserId, try by MongoDB _id
-                user = await _context.Users
-                    .Find(u => u.Id == id)
-                    .FirstOrDefaultAsync();
-            }
-            
-            if (user == null)
-            {
-                return NotFound($"User with id '{id}' not found");
-            }
-
-            var userDto = new UserDto
-            {
-                Id = user.Id,
-                IdentityUserId = user.IdentityUserId,
-                UserName = user.UserName,
-                DisplayName = user.DisplayName,
-                Bio = user.Bio,
-                AvatarUrl = user.AvatarUrl,
-                Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
-                FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
-                Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-                IsPrivate = user.IsPrivate,
-                CreatedAt = user.CreatedAt
-            };
-
-            return Ok(userDto);
-        }
-        catch (MongoDB.Driver.MongoConnectionException)
-        {
-            return StatusCode(503, "Database connection failed. Please try again later.");
-        }
-        catch (Exception)
-        {
-            return StatusCode(500, "Internal server error");
-        }
-    }
-
+    public async Task<object> Check(string identityUserId) { Input.Owner(User, identityUserId); var user = await db.Users.Find(x => x.IdentityUserId == identityUserId).FirstOrDefaultAsync(); return new { exists = user != null, userId = identityUserId, mongoId = user?.Id, userName = user?.UserName }; }
     [HttpPost("batch")]
-    public async Task<ActionResult<IEnumerable<UserDto>>> GetUsersBatch([FromBody] BatchUserRequest request)
+    public async Task<object> Batch(BatchUserRequest request)
     {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        if (request.UserIds == null || !request.UserIds.Any())
-        {
-            return Ok(new List<UserDto>());
-        }
-
-        try
-        {
-            // Limit batch size to prevent abuse
-            var userIds = request.UserIds.Take(50).ToList();
-            
-            Console.WriteLine($"[BatchUser] Searching for {userIds.Count} users: {string.Join(", ", userIds)}");
-
-            // Separate GUIDs (IdentityUserIds) from ObjectIds (MongoDB Ids)
-            var guids = new List<string>();
-            var objectIds = new List<string>();
-            
-            foreach (var id in userIds)
-            {
-                if (string.IsNullOrEmpty(id)) continue;
-                
-                // Check if it's a valid MongoDB ObjectId (24 hex chars)
-                if (id.Length == 24 && System.Text.RegularExpressions.Regex.IsMatch(id, @"^[0-9a-fA-F]{24}$"))
-                {
-                    objectIds.Add(id);
-                }
-                else
-                {
-                    // Assume it's a GUID (IdentityUserId)
-                    guids.Add(id);
-                }
-            }
-
-            var users = new List<Models.User>();
-
-            // Query by IdentityUserId (GUIDs)
-            if (guids.Any())
-            {
-                var usersByIdentityId = await _context.Users
-                    .Find(u => guids.Contains(u.IdentityUserId))
-                    .ToListAsync();
-                users.AddRange(usersByIdentityId);
-            }
-
-            // Query by MongoDB ObjectId
-            if (objectIds.Any())
-            {
-                var usersByObjectId = await _context.Users
-                    .Find(u => objectIds.Contains(u.Id))
-                    .ToListAsync();
-                users.AddRange(usersByObjectId);
-            }
-            
-            Console.WriteLine($"[BatchUser] Found {users.Count} users in database");
-
-            var userDtos = users.Select(user => new UserDto
-            {
-                Id = user.Id,
-                IdentityUserId = user.IdentityUserId,
-                UserName = user.UserName,
-                DisplayName = user.DisplayName,
-                Bio = user.Bio,
-                AvatarUrl = user.AvatarUrl,
-                Playlists = user.Playlists?.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList() ?? new List<PlaylistReferenceDto>(),
-                FollowedUsers = user.FollowedUsers?.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList() ?? new List<UserReferenceDto>(),
-                Followers = user.Followers?.Select(f => new UserReferenceDto { Id = f.Id }).ToList() ?? new List<UserReferenceDto>(),
-                IsPrivate = user.IsPrivate,
-                CreatedAt = user.CreatedAt
-            }).ToList();
-
-            return Ok(userDtos);
-        }
-        catch (MongoDB.Driver.MongoConnectionException ex)
-        {
-            Console.WriteLine($"[BatchUser] MongoDB connection error: {ex.Message}");
-            return StatusCode(503, "Database connection failed. Please try again later.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[BatchUser] Internal server error: {ex.Message}\n{ex.StackTrace}");
-            return StatusCode(500, $"Internal server error: {ex.Message}");
-        }
+        if (request.UserIds.Count > 50) throw new ApiProblem(400, "Maximum batch size is 50.");
+        var guids = request.UserIds.Where(x => Guid.TryParse(x, out _)).ToList(); var ids = request.UserIds.Where(x => MongoDB.Bson.ObjectId.TryParse(x, out _)).ToList();
+        if (guids.Count + ids.Count != request.UserIds.Count) throw new ApiProblem(400, "Invalid profile identifier.");
+        var users = await db.Users.Find(x => guids.Contains(x.IdentityUserId) || ids.Contains(x.Id)).Limit(50).ToListAsync();
+        return await Task.WhenAll(users.Select(x => Dto(x, !ProfilePolicy.Visible(User, x), false)));
     }
-
-    public class BatchUserRequest
-    {
-        public List<string> UserIds { get; set; } = new();
-    }
-
     [HttpGet("search")]
-    public async Task<ActionResult<List<UserDto>>> SearchUsers(string q = "", int page = 1, int pageSize = 20)
+    public async Task<object> Search(string q = "", int page = 1, int pageSize = 20)
     {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            if (string.IsNullOrWhiteSpace(q))
-            {
-                return Ok(new List<UserDto>());
-            }
-
-            var queryLower = q.ToLower();
-            
-            // Search users by username or display name
-            var users = await _context.Users
-                .Find(u => 
-                    u.UserName.ToLower().Contains(queryLower) || 
-                    (u.DisplayName != null && u.DisplayName.ToLower().Contains(queryLower))
-                )
-                .Skip((page - 1) * pageSize)
-                .Limit(pageSize)
-                .ToListAsync();
-
-            var userDtos = users.Select(user => new UserDto
-            {
-                Id = user.Id,
-                IdentityUserId = user.IdentityUserId,
-                UserName = user.UserName,
-                DisplayName = user.DisplayName,
-                Bio = user.Bio,
-                AvatarUrl = user.AvatarUrl,
-                Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
-                FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
-                Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-                IsPrivate = user.IsPrivate,
-                CreatedAt = user.CreatedAt
-            }).ToList();
-
-            return Ok(userDtos);
-        }
-        catch (MongoDB.Driver.MongoConnectionException)
-        {
-            return StatusCode(503, "Database connection failed. Please try again later.");
-        }
-        catch (Exception)
-        {
-            return StatusCode(500, "Error searching users");
-        }
+        Input.Page(pageSize, checked((page - 1) * pageSize)); q = Input.Text(q, 100); if (q.Length == 0) return Array.Empty<object>();
+        var literal = new MongoDB.Bson.BsonRegularExpression(System.Text.RegularExpressions.Regex.Escape(q), "i");
+        var filter = Builders<Models.User>.Filter.Regex(x => x.UserName, literal) | Builders<Models.User>.Filter.Regex(x => x.DisplayName, literal);
+        var users = await db.Users.Find(filter).SortBy(x => x.UserName).Skip((page - 1) * pageSize).Limit(pageSize).ToListAsync();
+        return await Task.WhenAll(users.Select(x => Dto(x, !ProfilePolicy.Visible(User, x), false)));
     }
-
-    [HttpPost]
-    public async Task<ActionResult<UserDto>> CreateUser(CreateUserDto dto)
+    [HttpPost("sync-user/{identityUserId}")]
+    public async Task<object> Sync(string identityUserId)
     {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        var user = new Models.User
-        {
-            IdentityUserId = dto.IdentityUserId,
-            UserName = dto.UserName,
-            DisplayName = dto.DisplayName,
-            Bio = dto.Bio,
-            AvatarUrl = dto.AvatarUrl,
-            IsPrivate = dto.IsPrivate
-        };
-
-        await _context.Users.InsertOneAsync(user);
-
-        var userDto = new UserDto
-        {
-            Id = user.Id,
-            IdentityUserId = user.IdentityUserId,
-            UserName = user.UserName,
-            DisplayName = user.DisplayName,
-            Bio = user.Bio,
-            AvatarUrl = user.AvatarUrl,
-            Playlists = user.Playlists.Select(p => new PlaylistReferenceDto { Id = p.Id }).ToList(),
-            FollowedUsers = user.FollowedUsers.Select(fu => new UserReferenceDto { Id = fu.Id }).ToList(),
-            Followers = user.Followers.Select(f => new UserReferenceDto { Id = f.Id }).ToList(),
-            IsPrivate = user.IsPrivate,
-            CreatedAt = user.CreatedAt
-        };
-
-        return CreatedAtAction(nameof(GetUser), new { id = user.Id }, userDto);
+        Input.Owner(User, identityUserId);
+        using var response = await clients.CreateClient("Identity").GetAsync($"api/auth/internal/users/{identityUserId}");
+        if (!response.IsSuccessStatusCode) throw new ApiProblem(503, "Account reconciliation unavailable.");
+        var user = await response.Content.ReadFromJsonAsync<IdentityUserDto>() ?? throw new ApiProblem(503, "Invalid account contract.");
+        await db.Users.UpdateOneAsync(x => x.IdentityUserId == user.Id, Builders<Models.User>.Update.SetOnInsert(x => x.IdentityUserId, user.Id).Set(x => x.UserName, user.UserName ?? "").Set(x => x.IsPrivate, user.IsPrivate ?? false).Set(x => x.Roles, user.Roles), new UpdateOptions { IsUpsert = true });
+        return new { message = "Profile reconciled" };
     }
-
-    [HttpPut("{id}")]
-    public async Task<IActionResult> UpdateUser(string id, UpdateUserDto dto)
+    [HttpPost("sync-users"), Authorize(Roles = "Admin")]
+    public async Task<object> SyncAll()
     {
-        if (!_context.IsConnected || _context.Users == null)
+        using var response = await clients.CreateClient("Identity").GetAsync("api/auth/internal/users");
+        if (!response.IsSuccessStatusCode) throw new ApiProblem(503, "Account reconciliation unavailable.");
+        var envelope = await response.Content.ReadFromJsonAsync<IdentityUsers>() ?? throw new ApiProblem(503, "Invalid account contract.");
+        foreach (var u in envelope.Users) await db.Users.UpdateOneAsync(x => x.IdentityUserId == u.Id, Builders<Models.User>.Update.SetOnInsert(x => x.IdentityUserId, u.Id).Set(x => x.UserName, u.UserName ?? "").Set(x => x.IsPrivate, u.IsPrivate ?? false).Set(x => x.Roles, u.Roles), new UpdateOptions { IsUpsert = true });
+        return new { reconciled = envelope.Users.Count };
+    }
+    [HttpPut("identity/{id}"), HttpPut("{id}")]
+    public async Task<IActionResult> Update(string id, JsonElement patch)
+    {
+        if (patch.ValueKind != JsonValueKind.Object) throw new ApiProblem(400, "A profile object is required.");
+        foreach (var field in new[] { "displayName", "bio", "avatarUrl", "userName" })
+            if (patch.TryGetProperty(field, out var value) && value.ValueKind is not (JsonValueKind.String or JsonValueKind.Null)) throw new ApiProblem(400, $"{field} must be text or null.");
+        if (patch.TryGetProperty("isPrivate", out var flag) && flag.ValueKind is not (JsonValueKind.True or JsonValueKind.False)) throw new ApiProblem(400, "isPrivate must be a boolean.");
+        var user = await profiles.Own(User, id);
+        var update = Builders<Models.User>.Update.Set(x => x.UpdatedAt, DateTime.UtcNow);
+        if (patch.TryGetProperty("displayName", out var display)) update = update.Set(x => x.DisplayName, Input.Text(display.ValueKind == JsonValueKind.Null ? null : display.GetString(), 100));
+        if (patch.TryGetProperty("bio", out var bio)) update = update.Set(x => x.Bio, Input.Text(bio.ValueKind == JsonValueKind.Null ? null : bio.GetString(), 1000));
+        string? oldAvatar = null;
+        if (patch.TryGetProperty("avatarUrl", out var avatar)) { if (avatar.ValueKind != JsonValueKind.Null && avatar.GetString() != "") throw new ApiProblem(400, "Use the validated avatar upload."); oldAvatar = user.AvatarUrl; update = update.Set(x => x.AvatarUrl, null); }
+        if (patch.TryGetProperty("userName", out var name) || patch.TryGetProperty("isPrivate", out _))
         {
-            return StatusCode(503, "Service unavailable - database connection failed");
+            var username = name.ValueKind == JsonValueKind.Undefined ? user.UserName : Input.Text(name.GetString(), 60, true);
+            var isPrivate = patch.TryGetProperty("isPrivate", out var privacy) ? privacy.GetBoolean() : user.IsPrivate;
+            using var response = await clients.CreateClient("Identity").PostAsJsonAsync("api/auth/internal/profile", new { identityUserId = user.IdentityUserId, userName = username, isPrivate });
+            if (!response.IsSuccessStatusCode) throw new ApiProblem((int)response.StatusCode is 400 or 409 ? 409 : 503, "Account fields were not saved. Check the name or retry reconciliation.");
         }
-
-        var updateDefinition = Builders<Models.User>.Update
-            .Set(u => u.UpdatedAt, DateTime.UtcNow);
-
-        if (!string.IsNullOrEmpty(dto.UserName))
-            updateDefinition = updateDefinition.Set(u => u.UserName, dto.UserName);
-
-        if (!string.IsNullOrEmpty(dto.DisplayName))
-            updateDefinition = updateDefinition.Set(u => u.DisplayName, dto.DisplayName);
-
-        if (!string.IsNullOrEmpty(dto.Bio))
-            updateDefinition = updateDefinition.Set(u => u.Bio, dto.Bio);
-
-        if (!string.IsNullOrEmpty(dto.AvatarUrl))
-            updateDefinition = updateDefinition.Set(u => u.AvatarUrl, dto.AvatarUrl);
-
-        if (dto.IsPrivate.HasValue)
-            updateDefinition = updateDefinition.Set(u => u.IsPrivate, dto.IsPrivate.Value);
-
-        var result = await _context.Users.UpdateOneAsync(
-            u => u.Id == id,
-            updateDefinition);
-
-        if (result.MatchedCount == 0)
-        {
-            return NotFound();
-        }
-
+        var filter = Builders<Models.User>.Filter.Eq(x => x.Id, user.Id);
+        if (patch.TryGetProperty("avatarUrl", out _)) filter &= Builders<Models.User>.Filter.Eq(x => x.AvatarUrl, user.AvatarUrl);
+        if ((await db.Users.UpdateOneAsync(filter, update)).MatchedCount != 1) throw new ApiProblem(409, "The profile changed concurrently. Reload before saving.");
+        if (oldAvatar != null) await blobs.Cleanup(oldAvatar);
         return NoContent();
     }
-
-    [HttpPut("identity/{identityUserId}")]
-    public async Task<IActionResult> UpdateUserByIdentityId(string identityUserId, UpdateUserDto dto)
+    [HttpPost("identity/{id}/profile-picture"), HttpPost("{id}/profile-picture")]
+    [RequestSizeLimit(6 * 1024 * 1024)]
+    public async Task<object> Avatar(string id, IFormFile file)
     {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        var updateDefinition = Builders<Models.User>.Update
-            .Set(u => u.UpdatedAt, DateTime.UtcNow);
-
-        if (!string.IsNullOrEmpty(dto.UserName))
-            updateDefinition = updateDefinition.Set(u => u.UserName, dto.UserName);
-
-        if (!string.IsNullOrEmpty(dto.DisplayName))
-            updateDefinition = updateDefinition.Set(u => u.DisplayName, dto.DisplayName);
-
-        if (dto.Bio != null) // Allow setting empty bio
-            updateDefinition = updateDefinition.Set(u => u.Bio, dto.Bio);
-
-        if (!string.IsNullOrEmpty(dto.AvatarUrl))
-            updateDefinition = updateDefinition.Set(u => u.AvatarUrl, dto.AvatarUrl);
-
-        if (dto.IsPrivate.HasValue)
-            updateDefinition = updateDefinition.Set(u => u.IsPrivate, dto.IsPrivate.Value);
-
-        var result = await _context.Users.UpdateOneAsync(
-            u => u.IdentityUserId == identityUserId,
-            updateDefinition);
-
-        if (result.MatchedCount == 0)
-        {
-            return NotFound();
-        }
-
-        return NoContent();
+        var user = await profiles.Own(User, id);
+        var url = await blobs.UploadUserProfilePictureAsync(user.IdentityUserId, file.OpenReadStream(), file.FileName);
+        try { if ((await db.Users.UpdateOneAsync(x => x.Id == user.Id && x.AvatarUrl == user.AvatarUrl, Builders<Models.User>.Update.Set(x => x.AvatarUrl, url))).MatchedCount != 1) throw new ApiProblem(409, "The profile changed concurrently. Reload before uploading."); }
+        catch { await blobs.Cleanup(url); throw; }
+        await blobs.Published(url);
+        if (user.AvatarUrl != null) await blobs.Cleanup(user.AvatarUrl);
+        return new { avatarUrl = url, profilePictureUrl = url };
     }
-
-    [HttpPost("{id}/profile-picture")]
-    public async Task<IActionResult> UploadProfilePicture(string id, IFormFile file)
+    [HttpGet("avatar/{identityUserId}/{filename}"), AllowAnonymous]
+    public async Task<IActionResult> AvatarBytes(string identityUserId, string filename)
     {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        if (file == null || file.Length == 0)
-        {
-            return BadRequest("No file provided");
-        }
-
-        // Validate file type
-        var allowedTypes = new[] { "image/jpeg", "image/jpg", "image/png", "image/webp" };
-        if (!allowedTypes.Contains(file.ContentType.ToLower()))
-        {
-            return BadRequest("Only JPEG, PNG, and WebP images are allowed");
-        }
-
-        // Validate file size (max 5MB)
-        if (file.Length > 5 * 1024 * 1024)
-        {
-            return BadRequest("File size cannot exceed 5MB");
-        }
-
-        try
-        {
-            // Check if user exists
-            var user = await _context.Users.Find(u => u.Id == id).FirstOrDefaultAsync();
-            if (user == null)
-            {
-                return NotFound("User not found");
-            }
-
-            // Upload to Azure Blob Storage
-            using var stream = file.OpenReadStream();
-            var profilePictureUrl = await _azureBlobService.UploadUserProfilePictureAsync(id, stream, file.FileName);
-
-            // Update user's avatar URL in database
-            var updateDefinition = Builders<Models.User>.Update
-                .Set(u => u.AvatarUrl, profilePictureUrl)
-                .Set(u => u.UpdatedAt, DateTime.UtcNow);
-
-            var result = await _context.Users.UpdateOneAsync(
-                u => u.Id == id,
-                updateDefinition);
-
-            if (result.MatchedCount == 0)
-            {
-                return NotFound("User not found");
-            }
-
-            return Ok(new { avatarUrl = profilePictureUrl });
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error uploading profile picture: {ex.Message}");
-        }
+        var user = await profiles.Read(User, identityUserId);
+        if (user.AvatarUrl == null || !user.AvatarUrl.EndsWith('/' + filename, StringComparison.Ordinal)) return NotFound();
+        return File(await blobs.DownloadAvatar(identityUserId, filename), "image/png");
     }
-
-    [HttpPost("identity/{identityUserId}/profile-picture")]
-    public async Task<IActionResult> UploadProfilePictureByIdentityId(string identityUserId, IFormFile file)
+    [HttpPost("identity/{id}/listening-history"), HttpPost("{id}/listening-history")]
+    public async Task<object> Append(string id, AddListeningHistoryDto dto) { var user = await profiles.Own(User, id); await history.Append(user.IdentityUserId, dto, HttpContext.RequestAborted); return new { message = "Play saved" }; }
+    [HttpGet("identity/{id}/listening-history"), HttpGet("{id}/listening-history"), AllowAnonymous]
+    public async Task<object> History(string id, int limit = 50, int skip = 0) { var user = await profiles.Read(User, id); return await history.Read(user.IdentityUserId, limit, skip, HttpContext.RequestAborted); }
+    [HttpGet("identity/{id}/top-artists/week/current"), AllowAnonymous]
+    public async Task<object> Artists(string id) { var user = await profiles.Read(User, id); return await history.Artists(user.IdentityUserId, ct: HttpContext.RequestAborted); }
+    [HttpDelete("{id}"), Authorize(Roles = "Admin")]
+    public async Task<IActionResult> Delete(string id)
     {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        if (file == null || file.Length == 0)
-        {
-            return BadRequest("No file provided");
-        }
-
-        // Validate file type
-        var allowedTypes = new[] { "image/jpeg", "image/jpg", "image/png", "image/webp" };
-        if (!allowedTypes.Contains(file.ContentType.ToLower()))
-        {
-            return BadRequest("Only JPEG, PNG, and WebP images are allowed");
-        }
-
-        // Validate file size (max 5MB)
-        if (file.Length > 5 * 1024 * 1024)
-        {
-            return BadRequest("File size cannot exceed 5MB");
-        }
-
-        try
-        {
-            // Find user by identity user ID
-            var user = await _context.Users.Find(u => u.IdentityUserId == identityUserId).FirstOrDefaultAsync();
-            if (user == null)
-            {
-                return NotFound("User not found");
-            }
-
-            // Upload to Azure Blob Storage using the user's MongoDB ID
-            using var stream = file.OpenReadStream();
-            var profilePictureUrl = await _azureBlobService.UploadUserProfilePictureAsync(user.Id, stream, file.FileName);
-
-            // Update user's avatar URL in database
-            var updateDefinition = Builders<Models.User>.Update
-                .Set(u => u.AvatarUrl, profilePictureUrl)
-                .Set(u => u.UpdatedAt, DateTime.UtcNow);
-
-            var result = await _context.Users.UpdateOneAsync(
-                u => u.IdentityUserId == identityUserId,
-                updateDefinition);
-
-            if (result.MatchedCount == 0)
-            {
-                return NotFound("User not found");
-            }
-
-            return Ok(new { avatarUrl = profilePictureUrl });
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error uploading profile picture: {ex.Message}");
-        }
+        var user = await profiles.Find(id); using var request = new HttpRequestMessage(HttpMethod.Delete, $"api/auth/users/{user.IdentityUserId}"); request.Headers.TryAddWithoutValidation("Authorization", Request.Headers.Authorization.ToString());
+        using var result = await clients.CreateClient("Identity").SendAsync(request); return StatusCode((int)result.StatusCode);
     }
-
-    [HttpDelete("{id}")]
-    public async Task<IActionResult> DeleteUser(string id)
+    [HttpDelete("internal/{identityUserId}"), AllowAnonymous]
+    public async Task<IActionResult> Cleanup(string identityUserId)
     {
-        if (!_context.IsConnected || _context.Users == null)
+        if (!Input.Service(HttpContext, config)) return Unauthorized(); Input.GuidId(identityUserId);
+        var user = await db.Users.Find(x => x.IdentityUserId == identityUserId).FirstOrDefaultAsync();
+        using var musicRequest = new HttpRequestMessage(HttpMethod.Delete, $"api/playlists/internal/owner/{identityUserId}");
+        musicRequest.Headers.Add("X-Spotibuds-Service", config["ServiceAuth:Secret"]);
+        using var musicResponse = await clients.CreateClient("Music").SendAsync(musicRequest);
+        if (!musicResponse.IsSuccessStatusCode) throw new ApiProblem(503, "Playlist deletion is pending. Retry account reconciliation.");
+        if (user != null)
         {
-            return StatusCode(503, "Service unavailable - database connection failed");
+            var chats = await db.Chats.Find(x => x.Participants.Contains(user.Id)).Limit(100).Project(x => x.Id).ToListAsync();
+            await transactions.Run(async (session, ct) => { await db.Messages.DeleteManyAsync(session, x => chats.Contains(x.ChatId), cancellationToken: ct); await db.Chats.DeleteManyAsync(session, x => chats.Contains(x.Id), cancellationToken: ct); return true; }, HttpContext.RequestAborted);
+            if (await db.Chats.Find(x => x.Participants.Contains(user.Id)).AnyAsync()) throw new ApiProblem(503, "Account cleanup is progressing in bounded batches. Reconciliation will retry.");
+            await db.Friends.DeleteManyAsync(x => x.UserId == user.Id || x.FriendId == user.Id);
         }
-
-        var result = await _context.Users.DeleteOneAsync(u => u.Id == id);
-
-        if (result.DeletedCount == 0)
-        {
-            return NotFound();
-        }
-
-        return NoContent();
+        await db.Follows.DeleteManyAsync(x => x.FollowerId == identityUserId || x.FollowedId == identityUserId);
+        await db.Feed.DeleteManyAsync(x => x.IdentityUserId == identityUserId || x.WithIdentityUserId == identityUserId);
+        await db.History.DeleteManyAsync(x => x.IdentityUserId == identityUserId);
+        await db.Reactions.DeleteManyAsync(x => x.FromIdentityUserId == identityUserId || x.ToIdentityUserId == identityUserId);
+        await db.Notifications.DeleteManyAsync(x => x.SourceUserId == identityUserId || x.TargetUserId == identityUserId);
+        if (user?.AvatarUrl != null) await blobs.Cleanup(user.AvatarUrl);
+        if (user != null) await db.Users.DeleteOneAsync(x => x.Id == user.Id); return NoContent();
     }
-
-    // Listening History endpoints
-    [HttpPost("{userId}/listening-history")]
-    public async Task<ActionResult> AddToListeningHistory(string userId, [FromBody] AddListeningHistoryDto dto)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            var historyItem = new ListeningHistoryItem
-            {
-                SongId = dto.SongId,
-                SongTitle = dto.SongTitle,
-                Artist = dto.Artist,
-                CoverUrl = dto.CoverUrl,
-                PlayedAt = DateTime.UtcNow,
-                Duration = dto.Duration
-            };
-
-            var filter = Builders<Models.User>.Filter.Eq(u => u.Id, userId);
-            
-            // First, add the item to the history
-            var pushUpdate = Builders<Models.User>.Update
-                .Push(u => u.ListeningHistory, historyItem);
-
-            await _context.Users.UpdateOneAsync(filter, pushUpdate);
-
-            // Then, limit to last 100 items by removing older items
-            var user = await _context.Users.Find(filter).FirstOrDefaultAsync();
-            if (user != null && user.ListeningHistory.Count > 100)
-            {
-                var limitedHistory = user.ListeningHistory
-                    .OrderByDescending(h => h.PlayedAt)
-                    .Take(100)
-                    .ToList();
-                
-                var replaceUpdate = Builders<Models.User>.Update
-                    .Set(u => u.ListeningHistory, limitedHistory);
-                
-                await _context.Users.UpdateOneAsync(filter, replaceUpdate);
-            }
-
-            return Ok();
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error adding to listening history: {ex.Message}");
-        }
-    }
-
-    [HttpPost("identity/{identityUserId}/listening-history")]
-    public async Task<ActionResult> AddToListeningHistoryByIdentity(string identityUserId, [FromBody] AddListeningHistoryDto dto)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            var historyItem = new ListeningHistoryItem
-            {
-                SongId = dto.SongId,
-                SongTitle = dto.SongTitle,
-                Artist = dto.Artist,
-                CoverUrl = dto.CoverUrl,
-                PlayedAt = DateTime.UtcNow,
-                Duration = dto.Duration
-            };
-
-            var filter = Builders<Models.User>.Filter.Eq(u => u.IdentityUserId, identityUserId);
-            
-            // First, add the item to the history
-            var pushUpdate = Builders<Models.User>.Update
-                .Push(u => u.ListeningHistory, historyItem);
-
-            await _context.Users.UpdateOneAsync(filter, pushUpdate);
-
-            // Then, limit to last 100 items by removing older items
-            var user = await _context.Users.Find(filter).FirstOrDefaultAsync();
-            if (user != null && user.ListeningHistory.Count > 100)
-            {
-                var limitedHistory = user.ListeningHistory
-                    .OrderByDescending(h => h.PlayedAt)
-                    .Take(100)
-                    .ToList();
-                
-                var replaceUpdate = Builders<Models.User>.Update
-                    .Set(u => u.ListeningHistory, limitedHistory);
-                
-                await _context.Users.UpdateOneAsync(filter, replaceUpdate);
-            }
-
-            // Persist a recent_song feed item with stable key and trim to last N per user
-            if (_context.Feed != null)
-            {
-                var itemKey = $"recent:{identityUserId}:{dto.SongId}";
-                var feedItem = new User.Entities.FeedItem
-                {
-                    IdentityUserId = identityUserId,
-                    Type = "recent_song",
-                    SongId = dto.SongId,
-                    SongTitle = dto.SongTitle,
-                    Artist = dto.Artist,
-                    CoverUrl = dto.CoverUrl,
-                    PlayedAt = historyItem.PlayedAt,
-                    Key = itemKey,
-                    CreatedAt = DateTime.UtcNow
-                };
-
-                // Upsert by key+identity to avoid duplicates if repeated quickly
-                var upsertFilter = Builders<User.Entities.FeedItem>.Filter.And(
-                    Builders<User.Entities.FeedItem>.Filter.Eq(f => f.IdentityUserId, identityUserId),
-                    Builders<User.Entities.FeedItem>.Filter.Eq(f => f.Key, itemKey)
-                );
-                var updateDef = Builders<User.Entities.FeedItem>.Update
-                    .Set(f => f.IdentityUserId, feedItem.IdentityUserId)
-                    .Set(f => f.Type, feedItem.Type)
-                    .Set(f => f.SongId, feedItem.SongId)
-                    .Set(f => f.SongTitle, feedItem.SongTitle)
-                    .Set(f => f.Artist, feedItem.Artist)
-                    .Set(f => f.CoverUrl, feedItem.CoverUrl)
-                    .Set(f => f.PlayedAt, feedItem.PlayedAt)
-                    .Set(f => f.Key, feedItem.Key)
-                    .Set(f => f.CreatedAt, feedItem.CreatedAt);
-                await _context.Feed.UpdateOneAsync(upsertFilter, updateDef, new UpdateOptions { IsUpsert = true });
-
-                // Migrate any now_playing reactions to this recent_song post
-                if (_context.Reactions != null)
-                {
-                    var syntheticPostId = $"nowplaying:{identityUserId}:{dto.SongId}";
-                    Console.WriteLine($"[Migration] Checking for reactions with synthetic postId: {syntheticPostId}");
-                    
-                    var nowPlayingReactions = await _context.Reactions
-                        .Find(r => r.PostId == syntheticPostId)
-                        .ToListAsync();
-                    
-                    Console.WriteLine($"[Migration] Found {nowPlayingReactions.Count} now_playing reactions to migrate for song {dto.SongId}");
-                    
-                    if (nowPlayingReactions.Any())
-                    {
-                        Console.WriteLine($"[Migration] Migrating {nowPlayingReactions.Count} reactions from synthetic postId {syntheticPostId} to feedItem {feedItem.Id}");
-                        
-                        // Update all reactions to point to the new recent_song post
-                        foreach (var reaction in nowPlayingReactions)
-                        {
-                            Console.WriteLine($"  - Migrating reaction: {reaction.Emoji} from {reaction.FromUserName} (ID: {reaction.Id})");
-                            reaction.PostId = feedItem.Id;
-                            reaction.ContextType = "recent_song";
-                        }
-                        
-                        // Bulk update the reactions
-                        var bulkOps = nowPlayingReactions.Select(r => 
-                            new ReplaceOneModel<User.Entities.Reaction>(
-                                Builders<User.Entities.Reaction>.Filter.Eq(x => x.Id, r.Id), 
-                                r
-                            )
-                        ).ToList();
-                        
-                        if (bulkOps.Any())
-                        {
-                            await _context.Reactions.BulkWriteAsync(bulkOps);
-                            Console.WriteLine($"[Migration] SUCCESS: Migrated {bulkOps.Count} reactions from now_playing to recent_song post {feedItem.Id}");
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[Migration] No synthetic now_playing reactions found for postId: {syntheticPostId}");
-                    }
-                }
-
-                // Trim to last N recent_song items per user (configurable via env FEED_RECENT_MAX)
-                int maxRecent = 20;
-                var envMax = Environment.GetEnvironmentVariable("FEED_RECENT_MAX");
-                if (!string.IsNullOrEmpty(envMax) && int.TryParse(envMax, out var parsed) && parsed > 0 && parsed <= 200)
-                {
-                    maxRecent = parsed;
-                }
-                var recentItems = await _context.Feed
-                    .Find(f => f.IdentityUserId == identityUserId && f.Type == "recent_song")
-                    .SortByDescending(f => f.CreatedAt)
-                    .Skip(maxRecent)
-                    .ToListAsync();
-                if (recentItems.Count > 0)
-                {
-                    var idsToDelete = recentItems.Select(r => r.Id).ToList();
-                    await _context.Feed.DeleteManyAsync(f => idsToDelete.Contains(f.Id));
-                }
-            }
-
-            return Ok(new { success = true, message = "Added to listening history" });
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error adding to listening history: {ex.Message}");
-        }
-    }
-
-    [HttpGet("{userId}/listening-history")]
-    public async Task<ActionResult<List<ListeningHistoryItem>>> GetListeningHistory(string userId, int limit = 50, int skip = 0)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            var filter = Builders<Models.User>.Filter.Eq(u => u.Id, userId);
-            var projection = Builders<Models.User>.Projection.Include(u => u.ListeningHistory);
-            
-            var user = await _context.Users.Find(filter).Project<Models.User>(projection).FirstOrDefaultAsync();
-            
-            if (user == null)
-            {
-                return NotFound("User not found");
-            }
-
-            var history = user.ListeningHistory
-                .OrderByDescending(h => h.PlayedAt)
-                .Skip(skip)
-                .Take(limit)
-                .ToList();
-
-            // Update cover URLs by fetching fresh data from Music service
-            await UpdateListeningHistoryWithFreshCoverUrls(history);
-
-            return Ok(history);
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error retrieving listening history: {ex.Message}");
-        }
-    }
-
-    [HttpGet("identity/{identityUserId}/listening-history")]
-    public async Task<ActionResult<List<ListeningHistoryItem>>> GetListeningHistoryByIdentity(string identityUserId, int limit = 50, int skip = 0)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            var filter = Builders<Models.User>.Filter.Eq(u => u.IdentityUserId, identityUserId);
-            var projection = Builders<Models.User>.Projection.Include(u => u.ListeningHistory);
-            
-            var user = await _context.Users.Find(filter).Project<Models.User>(projection).FirstOrDefaultAsync();
-            
-            if (user == null)
-            {
-                return NotFound("User not found");
-            }
-
-            var history = user.ListeningHistory
-                .OrderByDescending(h => h.PlayedAt)
-                .Skip(skip)
-                .Take(limit)
-                .ToList();
-
-            // Update cover URLs by fetching fresh data from Music service
-            await UpdateListeningHistoryWithFreshCoverUrls(history);
-
-            return Ok(history);
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error retrieving listening history: {ex.Message}");
-        }
-    }
-
-    private async Task UpdateListeningHistoryWithFreshCoverUrls(List<ListeningHistoryItem> history)
-    {
-        try
-        {
-            using var httpClient = new HttpClient();
-            httpClient.BaseAddress = new Uri("http://localhost:5001/");
-            httpClient.Timeout = TimeSpan.FromSeconds(5); // Reduced timeout to avoid blocking
-
-            // Group by song ID to avoid duplicate API calls
-            var songIds = history.Select(h => h.SongId).Distinct().ToList();
-            var songDataCache = new Dictionary<string, string>();
-
-            var tasks = songIds.Select(async songId =>
-            {
-                try
-                {
-                    var response = await httpClient.GetAsync($"api/songs/{songId}");
-                    if (response.IsSuccessStatusCode)
-                    {
-                        var songJson = await response.Content.ReadAsStringAsync();
-                        var songData = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(songJson);
-                        
-                        if (songData.TryGetProperty("coverUrl", out var coverUrlElement))
-                        {
-                            var coverUrl = coverUrlElement.GetString();
-                            if (!string.IsNullOrEmpty(coverUrl))
-                            {
-                                lock (songDataCache)
-                                {
-                                    songDataCache[songId] = coverUrl;
-                                }
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // Log but don't fail the entire request for one song
-                    Console.WriteLine($"Failed to get cover URL for song {songId}: {ex.Message}");
-                }
-            });
-
-            // Wait for all requests with a timeout
-            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10));
-
-            // Update history items with fresh cover URLs
-            foreach (var item in history)
-            {
-                if (songDataCache.ContainsKey(item.SongId))
-                {
-                    item.CoverUrl = songDataCache[item.SongId];
-                }
-            }
-
-            Console.WriteLine($"Updated {songDataCache.Count} cover URLs from Music service");
-        }
-        catch (Exception ex)
-        {
-            // Log but don't fail the entire request if Music service is unavailable
-            Console.WriteLine($"Failed to update cover URLs from Music service: {ex.Message}");
-        }
-    }
-
-    // Top Artists (current week)
-    [HttpGet("identity/{identityUserId}/top-artists/week/current")]
-    public async Task<ActionResult<object>> GetTopArtistsForCurrentWeek(string identityUserId)
-    {
-        if (!_context.IsConnected || _context.Users == null)
-        {
-            return StatusCode(503, "Service unavailable - database connection failed");
-        }
-
-        try
-        {
-            var filter = Builders<Models.User>.Filter.Eq(u => u.IdentityUserId, identityUserId);
-            var projection = Builders<Models.User>.Projection
-                .Include(u => u.TopArtistsWeekStart)
-                .Include(u => u.TopArtistsCurrentWeek)
-                .Include(u => u.ListeningHistory);
-
-            var user = await _context.Users.Find(filter).Project<Models.User>(projection).FirstOrDefaultAsync();
-            if (user == null)
-            {
-                return NotFound("User not found");
-            }
-
-            var currentWeekStart = GetCurrentWeekStartUtc();
-            bool cacheValid = user.TopArtistsWeekStart.HasValue && user.TopArtistsWeekStart.Value == currentWeekStart && user.TopArtistsCurrentWeek != null && user.TopArtistsCurrentWeek.Count > 0;
-            // If cache is valid and at least one artist has count > 1, trust cache; else recompute
-            if (cacheValid && user.TopArtistsCurrentWeek.Any(a => a.Count > 1))
-            {
-                return Ok(user.TopArtistsCurrentWeek.OrderByDescending(a => a.Count).Take(3));
-            }
-
-            // Compute from listening history for current week
-            var weekItems = user.ListeningHistory
-                .Where(h => h.PlayedAt >= currentWeekStart)
-                .ToList();
-
-            // Count plays per individual artist (split by comma)
-            var dict = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in weekItems)
-            {
-                if (string.IsNullOrWhiteSpace(item.Artist)) continue;
-                var parts = item.Artist.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                foreach (var p in parts)
-                {
-                    var key = p.Trim();
-                    if (string.IsNullOrWhiteSpace(key)) continue;
-                    if (!dict.ContainsKey(key)) dict[key] = 0;
-                    dict[key]++;
-                }
-            }
-
-            var top = dict
-                .Select(kv => new TopArtist { Name = kv.Key, Count = kv.Value })
-                .OrderByDescending(t => t.Count)
-                .ThenBy(t => t.Name)
-                .Take(3)
-                .ToList();
-
-            // Save cache
-            var update = Builders<Models.User>.Update
-                .Set(u => u.TopArtistsWeekStart, currentWeekStart)
-                .Set(u => u.TopArtistsCurrentWeek, top);
-            await _context.Users.UpdateOneAsync(filter, update);
-
-            return Ok(top);
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"Error computing top artists: {ex.Message}");
-        }
-    }
-
-    [NonAction]
-    private static DateTime GetCurrentWeekStartUtc()
-    {
-        // Week starts Sunday 00:00 UTC
-        var now = DateTime.UtcNow;
-        int diff = (int)now.DayOfWeek; // Sunday=0
-        var start = new DateTime(now.Year, now.Month, now.Day, 0, 0, 0, DateTimeKind.Utc).AddDays(-diff);
-        return start;
-    }
-
-
+    public class BatchUserRequest { public List<string> UserIds { get; set; } = []; }
+    public class IdentityUsers { public List<IdentityUserDto> Users { get; set; } = []; }
 }
-
-public class UserDto
-{
-    public string Id { get; set; } = string.Empty;
-    public string IdentityUserId { get; set; } = string.Empty;
-    public string UserName { get; set; } = string.Empty;
-    public string? DisplayName { get; set; }
-    public string? Bio { get; set; }
-    public string? AvatarUrl { get; set; }
-    public List<PlaylistReferenceDto> Playlists { get; set; } = new();
-    public List<UserReferenceDto> FollowedUsers { get; set; } = new();
-    public List<UserReferenceDto> Followers { get; set; } = new();
-    public bool IsPrivate { get; set; }
-    public DateTime CreatedAt { get; set; }
-}
-
-public class PlaylistReferenceDto
-{
-    public string Id { get; set; } = string.Empty;
-}
-
-public class UserReferenceDto
-{
-    public string Id { get; set; } = string.Empty;
-}
-
-public class CreateUserDto
-{
-    public string IdentityUserId { get; set; } = string.Empty;
-    public string UserName { get; set; } = string.Empty;
-    public string? DisplayName { get; set; }
-    public string? Bio { get; set; }
-    public string? AvatarUrl { get; set; }
-    public bool IsPrivate { get; set; } = false;
-}
-
-public class UpdateUserDto
-{
-    public string? UserName { get; set; }
-    public string? DisplayName { get; set; }
-    public string? Bio { get; set; }
-    public string? AvatarUrl { get; set; }
-    public bool? IsPrivate { get; set; }
-}
-
-public class IdentityUserDto
-{
-    public string Id { get; set; } = string.Empty;
-    public string? UserName { get; set; }
-    public string? Email { get; set; }
-    public bool? IsPrivate { get; set; }
-    public DateTime? CreatedAt { get; set; }
-}
-
-public class AddListeningHistoryDto
-{
-    public string SongId { get; set; } = string.Empty;
-    public string SongTitle { get; set; } = string.Empty;
-    public string Artist { get; set; } = string.Empty;
-    public string? CoverUrl { get; set; }
-    public int Duration { get; set; } = 0; // Duration listened in seconds
-}
+public class IdentityUserDto { public string Id { get; set; } = ""; public string? UserName { get; set; } public bool? IsPrivate { get; set; } public List<string> Roles { get; set; } = []; }
+public class AddListeningHistoryDto { public string SongId { get; set; } = ""; public string SongTitle { get; set; } = ""; public string Artist { get; set; } = ""; public string? CoverUrl { get; set; } public int Duration { get; set; } }
