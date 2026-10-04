@@ -8,7 +8,7 @@ namespace User.Hubs;
 [Authorize]
 public class FriendHub(MongoDbContext db, SocialCommands social, ChatCommands chat, ProfilePolicy profiles, PresenceStore presence) : Hub
 {
-    private string Actor => Input.Actor(Context.User!);
+    private string Actor => SocialCommands.Account(Input.Actor(Context.User!));
     public override async Task OnConnectedAsync() { await profiles.Find(Actor); await Groups.AddToGroupAsync(Context.ConnectionId, $"user_{Actor}"); if (presence.Add(Actor, Context.ConnectionId)) await Status(true); await GetOnlineFriends(); await base.OnConnectedAsync(); }
     public override async Task OnDisconnectedAsync(Exception? exception) { if (presence.Remove(Actor, Context.ConnectionId)) await Status(false); await base.OnDisconnectedAsync(exception); }
     private async Task Status(bool online)
@@ -21,9 +21,10 @@ public class FriendHub(MongoDbContext db, SocialCommands social, ChatCommands ch
     public async Task SendFriendRequest(string targetUserId) => await social.Request(Actor, targetUserId);
     public async Task AcceptFriendRequest(string requestId) => await social.Transition(Actor, requestId, FriendStatus.Accepted);
     public async Task DeclineFriendRequest(string requestId) => await social.Transition(Actor, requestId, FriendStatus.Declined);
+    public async Task CancelFriendRequest(string requestId) => await social.Remove(Actor, requestId, pendingOnly: true);
     public async Task RemoveFriend(string friendId)
     {
-        var self = await profiles.Find(Actor); var other = await profiles.Find(friendId); var relation = await db.Friends.Find(x => x.PairKey == SocialCommands.Pair(self.Id, other.Id)).FirstOrDefaultAsync() ?? throw new ApiProblem(404, "Friendship not found."); await social.Remove(Actor, relation.Id);
+        var self = await profiles.Find(Actor); var other = await profiles.Find(SocialCommands.Account(friendId)); var relation = await db.Friends.Find(x => x.PairKey == SocialCommands.Pair(self.Id, other.Id)).FirstOrDefaultAsync() ?? throw new ApiProblem(404, "Friendship not found."); await social.Remove(Actor, SocialCommands.PublicId(relation));
     }
     public async Task<object> SendMessage(string chatId, string message, string? clientMessageId = null) => await chat.Send(Actor, chatId, message, clientMessageId);
     public async Task MarkMessageAsRead(string messageId) => await chat.Read(Actor, messageId);
