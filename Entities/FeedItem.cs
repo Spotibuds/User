@@ -26,6 +26,11 @@ public class FeedItem : BaseEntity
 	[BsonElement("playedAt")]
 	public DateTime? PlayedAt { get; set; }
 
+	// The latest source tuple prevents delayed history requests from moving a stable post backwards.
+	[BsonElement("lastHistoryEventId")]
+	[BsonIgnoreIfNull]
+	public string? LastHistoryEventId { get; set; }
+
 	[BsonElement("key")]
 	public string? Key { get; set; } // stable de-dupe key per identityUserId+type+songId or payload
 

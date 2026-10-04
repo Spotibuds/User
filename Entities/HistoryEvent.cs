@@ -5,6 +5,8 @@ public class HistoryEvent : BaseEntity
     public string SongId { get; set; } = "";
     public string SongTitle { get; set; } = "";
     public string Artist { get; set; } = "";
+    // Preserve actual catalogue names, including commas. Older rows retain the display-string fallback.
+    public List<string>? ArtistNames { get; set; }
     public string? CoverUrl { get; set; }
     public DateTime PlayedAt { get; set; } = DateTime.UtcNow;
     public int Duration { get; set; }

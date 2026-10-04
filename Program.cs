@@ -24,6 +24,7 @@ Required("AzureStorage:ConnectionString");
 builder.Services.AddControllers(options => options.Filters.Add<ApiSafetyFilter>()).AddJsonOptions(options => options.JsonSerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter()));
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddMemoryCache(options => options.SizeLimit = 5000);
+builder.Services.AddDataProtection();
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(options =>
 {
     options.TokenValidationParameters = new TokenValidationParameters
@@ -56,6 +57,7 @@ builder.Services.AddScoped<SocialCommands>();
 builder.Services.AddScoped<ChatCommands>();
 builder.Services.AddSingleton<MongoTransactions>();
 builder.Services.AddScoped<HistoryService>();
+builder.Services.AddScoped<FeedPager>();
 builder.Services.AddScoped<CanonicalSongReader>();
 builder.Services.AddSingleton<IAzureBlobService, AzureBlobService>();
 builder.Services.AddSingleton<IActiveChatTrackingService, ActiveChatTrackingService>();

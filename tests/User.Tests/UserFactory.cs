@@ -85,11 +85,12 @@ public sealed class UserFactory : WebApplicationFactory<Program>
             new Models.User { IdentityUserId = Bob, UserName = "bob", DisplayName = "Bob", Roles = ["User"] },
             new Models.User { IdentityUserId = Mallory, UserName = "mallory", DisplayName = "Mallory", Roles = ["User"] }
         });
-        // Await the actual hosted index initializer before concurrency assertions.
-        for (var attempt = 0; attempt < 50; attempt++)
+        // Wait for the whole hosted initializer, not an early collection's index.
+        // Readiness stays bounded without repeatedly querying Mongo during startup.
+        var indexes = Services.GetRequiredService<IndexState>();
+        for (var attempt = 0; attempt < 200; attempt++)
         {
-            using var cursor = await Db.Follows.Indexes.ListAsync();
-            if ((await cursor.ToListAsync()).Count > 1) return;
+            if (indexes.Ready) return;
             await Task.Delay(50);
         }
         throw new InvalidOperationException("Disposable Mongo indexes did not initialize");

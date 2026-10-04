@@ -47,15 +47,7 @@ public sealed record ReactionPostReference(string PostId, string Owner, string C
     }
     private static async Task<List<string>> Artists(MongoDbContext db, IClientSessionHandle session, string account, DateTime week, CancellationToken ct)
     {
-        var pipeline = new BsonDocument[] {
-            new("$match", new BsonDocument { { "IdentityUserId", account }, { "PlayedAt", new BsonDocument { { "$gte", week }, { "$lt", week.AddDays(7) } } } }),
-            new("$project", new BsonDocument("artists", new BsonDocument("$split", new BsonArray { "$Artist", "," }))),
-            new("$unwind", "$artists"),
-            new("$group", new BsonDocument { { "_id", new BsonDocument("$trim", new BsonDocument("input", "$artists")) }, { "count", new BsonDocument("$sum", 1) } }),
-            new("$match", new BsonDocument("_id", new BsonDocument("$ne", ""))),
-            new("$sort", new BsonDocument { { "count", -1 }, { "_id", 1 } }), new("$limit", 3)
-        };
-        var rows = await db.History.Aggregate<BsonDocument>(session, pipeline, new AggregateOptions { MaxTime = TimeSpan.FromSeconds(2) }).ToListAsync(ct);
-        return rows.Select(x => x["_id"].AsString).ToList();
+        var rows = await HistoryService.ArtistsInSnapshot(db, session, account, week, asOf: null, ct);
+        return rows.Select(x => x.Name).ToList();
     }
 }
