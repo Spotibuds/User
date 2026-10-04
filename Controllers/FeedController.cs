@@ -7,7 +7,7 @@ using User.Entities;
 using User.Services;
 namespace User.Controllers;
 [ApiController, Route("api/feed")]
-public class FeedController(MongoDbContext db, ProfilePolicy profiles, HistoryService history, INowPlayingStore playing, TimeProvider clock, CanonicalSongReader songs) : ControllerBase
+public class FeedController(MongoDbContext db, ProfilePolicy profiles, HistoryService history, INowPlayingStore playing, TimeProvider clock, CanonicalSongReader songs, MongoTransactions transactions, INotificationService notifications, ILogger<FeedController> logger) : ControllerBase
 {
     private static readonly SemaphoreSlim ReactionGate = new(1, 1);
     private string Actor => Input.Actor(User);
@@ -95,22 +95,69 @@ public class FeedController(MongoDbContext db, ProfilePolicy profiles, HistorySe
     public async Task<object> React(Reaction request)
     {
         if (!new[] { "👍", "❤️", "😂", "😮", "🔥", "👏" }.Contains(request.Emoji)) throw new ApiProblem(400, "Choose a supported reaction.");
-        var self = await profiles.Find(Actor); request.FromIdentityUserId = Actor; request.FromUserName = self.UserName;
-        if (request.ContextType == "now_playing")
-        {
-            await profiles.Read(User, request.ToIdentityUserId); var state = playing.Get(request.ToIdentityUserId); if (state == null || state.SongId != request.SongId) throw new ApiProblem(404, "Playback has ended.");
-            var key = $"recent_song:{state.IdentityUserId}:{state.SongId}";
-            var post = await db.Feed.FindOneAndUpdateAsync(x => x.Key == key, Builders<FeedItem>.Update.SetOnInsert(x => x.Key, key).SetOnInsert(x => x.IdentityUserId, state.IdentityUserId).SetOnInsert(x => x.Type, "recent_song").SetOnInsert(x => x.SongId, state.SongId).SetOnInsert(x => x.SongTitle, state.SongTitle).SetOnInsert(x => x.Artist, state.Artist).SetOnInsert(x => x.CoverUrl, state.CoverUrl).SetOnInsert(x => x.PlayedAt, clock.GetUtcNow().UtcDateTime), new FindOneAndUpdateOptions<FeedItem> { IsUpsert = true, ReturnDocument = ReturnDocument.After });
-            request.PostId = post.Id; request.ContextType = "recent_song";
-        }
-        if (string.IsNullOrWhiteSpace(request.PostId)) throw new ApiProblem(400, "Post identifier required.");
-        await Post(request.PostId); request.ToIdentityUserId = await PostOwner(request.PostId); await profiles.Read(User, request.ToIdentityUserId);
-        await ReactionGate.WaitAsync();
+        var actor = SocialCommands.Account(Actor); var cancellationToken = HttpContext.RequestAborted;
+        await ReactionGate.WaitAsync(cancellationToken);
         try
         {
-            var existing = await db.Reactions.FindOneAndDeleteAsync(x => x.PostId == request.PostId && x.FromIdentityUserId == Actor && x.Emoji == request.Emoji);
-            if (existing != null) return new { success = true, message = "Reaction removed", action = "removed" };
-            request.Id = MongoDB.Bson.ObjectId.GenerateNewId().ToString(); request.CreatedAt = clock.GetUtcNow().UtcDateTime; await db.Reactions.InsertOneAsync(request); return new { success = true, message = "Reaction saved", action = "added" };
+            var result = await transactions.Run(async (session, ct) =>
+            {
+                var now = DateTimeOffset.FromUnixTimeMilliseconds(clock.GetUtcNow().ToUnixTimeMilliseconds()).UtcDateTime;
+                var postId = request.PostId;
+                if (request.ContextType == "now_playing" || postId?.StartsWith("nowplaying:", StringComparison.Ordinal) == true)
+                {
+                    var parts = postId?.Split(':');
+                    var owner = SocialCommands.Account(parts is { Length: 3 } && parts[0] == "nowplaying" ? parts[1] : request.ToIdentityUserId);
+                    var songId = parts is { Length: 3 } && parts[0] == "nowplaying" ? parts[2] : request.SongId;
+                    if (songId == null) throw new ApiProblem(400, "Song identifier required.");
+                    Input.ObjectId(songId);
+                    var author = await db.Users.Find(session, x => x.IdentityUserId == owner).FirstOrDefaultAsync(ct) ?? throw new ApiProblem(404, "Post author no longer exists.");
+                    if (!ProfilePolicy.Visible(User, author)) throw new ApiProblem(403, "This profile is private.");
+                    var state = playing.Get(owner);
+                    if (state == null || !state.IsPlaying || state.SongId != songId) throw new ApiProblem(404, "Playback has ended.");
+                    var key = $"recent_song:{owner}:{state.SongId}";
+                    var post = await db.Feed.FindOneAndUpdateAsync(session, Builders<FeedItem>.Filter.Eq(x => x.Key, key), Builders<FeedItem>.Update.SetOnInsert(x => x.Key, key).SetOnInsert(x => x.IdentityUserId, owner).SetOnInsert(x => x.Type, "recent_song").SetOnInsert(x => x.SongId, state.SongId).SetOnInsert(x => x.SongTitle, state.SongTitle).SetOnInsert(x => x.Artist, state.Artist).SetOnInsert(x => x.CoverUrl, state.CoverUrl).SetOnInsert(x => x.PlayedAt, now), new FindOneAndUpdateOptions<FeedItem, FeedItem> { IsUpsert = true, ReturnDocument = ReturnDocument.After }, ct);
+                    postId = post.Id;
+                }
+                var reference = await ReactionPostReference.Read(db, session, postId ?? "", actor, clock, ct, User.IsInRole("Admin"));
+                var accounts = new[] { actor, reference.Owner }.Distinct().ToList();
+                var current = await db.Users.Find(session, x => accounts.Contains(x.IdentityUserId)).ToListAsync(ct);
+                if (current.Count != accounts.Count) throw new ApiProblem(404, "A participant profile is missing.");
+                foreach (var profile in current.OrderBy(x => x.Id, StringComparer.Ordinal))
+                {
+                    var touchedAt = profile.UpdatedAt is DateTime previous && previous >= now ? previous.AddMilliseconds(1) : now;
+                    var touched = await db.Users.UpdateOneAsync(session, x => x.Id == profile.Id && x.IdentityUserId == profile.IdentityUserId, Builders<Models.User>.Update.Set(x => x.UpdatedAt, touchedAt), cancellationToken: ct);
+                    if (touched.MatchedCount != 1) throw new ApiProblem(404, "A participant profile is missing.");
+                }
+                var self = current.Single(x => x.IdentityUserId == actor);
+                var noticeKey = $"reaction:{reference.PostId}:{actor}:{reference.Owner}";
+                var existing = await db.Reactions.FindOneAndDeleteAsync(session, x => x.PostId == reference.PostId && x.FromIdentityUserId == actor && x.Emoji == request.Emoji, cancellationToken: ct);
+                if (existing != null)
+                {
+                    var remaining = await db.Reactions.Find(session, x => x.PostId == reference.PostId && x.FromIdentityUserId == actor).SortBy(x => x.Id).FirstOrDefaultAsync(ct);
+                    var filter = Builders<Notification>.Filter.Where(x => x.Key == noticeKey && x.Type == NotificationType.Reaction && x.Status != NotificationStatus.Handled);
+                    // Retain one attention record per actor/post. Its live reference follows
+                    // a remaining reaction; removing the final reaction terminalizes it.
+                    var update = remaining == null
+                        ? Builders<Notification>.Update.Set(x => x.Status, NotificationStatus.Handled).Set(x => x.HandledAt, now)
+                        : Builders<Notification>.Update.Set("Data.reactionId", remaining.Id).Set("Data.emoji", remaining.Emoji).Set(x => x.Message, $"{remaining.Emoji} on your music post.");
+                    var changed = await db.Notifications.UpdateManyAsync(session, filter, update, cancellationToken: ct);
+                    return (added: false, notice: (Notification?)null, target: reference.Owner, changed: changed.ModifiedCount > 0);
+                }
+                var reaction = new Reaction { FromIdentityUserId = actor, FromUserName = self.UserName, ToIdentityUserId = reference.Owner, PostId = reference.PostId, Emoji = request.Emoji, ContextType = reference.ContextType, SongId = reference.SongId, SongTitle = reference.SongTitle, Artist = reference.Artist, CreatedAt = now };
+                await db.Reactions.InsertOneAsync(session, reaction, cancellationToken: ct);
+                Notification? notice = null;
+                if (actor != reference.Owner && !await db.Notifications.Find(session, x => x.Key == noticeKey).AnyAsync(ct))
+                    notice = await notifications.PersistAsync(session, new Notification { TargetUserId = reference.Owner, SourceUserId = actor, Type = NotificationType.Reaction, Title = $"{self.UserName} reacted to your music", Message = $"{reaction.Emoji} on your music post.", Key = noticeKey, Data = new() { ["reactionId"] = reaction.Id, ["postId"] = reference.PostId, ["actionPostId"] = reference.ActionPostId, ["emoji"] = reaction.Emoji }, ActionUrl = $"/feed/post/{Uri.EscapeDataString(reference.ActionPostId)}", CreatedAt = now, ExpiresAt = reference.ExpiresAt }, ct);
+                return (added: true, notice, target: reference.Owner, changed: false);
+            }, cancellationToken);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            try
+            {
+                if (result.notice != null) await notifications.PublishAsync(result.notice).WaitAsync(timeout.Token);
+                else if (result.changed) await notifications.RefreshCountAsync(result.target).WaitAsync(timeout.Token);
+            }
+            catch (Exception ex) { logger.LogWarning("Committed reaction event could not be published ({ErrorType}). Clients recover through persisted state.", ex.GetType().Name); }
+            return new { success = true, message = result.added ? "Reaction saved" : "Reaction removed", action = result.added ? "added" : "removed" };
         }
         finally { ReactionGate.Release(); }
     }

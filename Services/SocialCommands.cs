@@ -18,6 +18,20 @@ public sealed class SocialCommands(MongoDbContext db, ProfilePolicy profiles, IN
             (Builders<Friend>.Filter.Eq(x => x.RequestId, null) & Builders<Friend>.Filter.Eq(x => x.Id, id));
     }
     private static string RequestKey(Friend friend) => $"friend-request:{PublicId(friend)}";
+    private DateTime Now => DateTimeOffset.FromUnixTimeMilliseconds(clock.GetUtcNow().ToUnixTimeMilliseconds()).UtcDateTime;
+    private async Task<Dictionary<string, Models.User>> TouchProfiles(IClientSessionHandle session, IEnumerable<string> accounts, CancellationToken ct)
+    {
+        var ids = accounts.Distinct().ToList();
+        var current = await db.Users.Find(session, x => ids.Contains(x.IdentityUserId)).ToListAsync(ct);
+        if (current.Count != ids.Count) throw new ApiProblem(404, "A participant profile is missing.");
+        foreach (var user in current.OrderBy(x => x.Id, StringComparer.Ordinal))
+        {
+            var touchedAt = user.UpdatedAt is DateTime previous && previous >= Now ? previous.AddMilliseconds(1) : Now;
+            var touched = await db.Users.UpdateOneAsync(session, x => x.Id == user.Id && x.IdentityUserId == user.IdentityUserId, Builders<Models.User>.Update.Set(x => x.UpdatedAt, touchedAt), cancellationToken: ct);
+            if (touched.MatchedCount != 1) throw new ApiProblem(404, "A participant profile is missing.");
+        }
+        return current.ToDictionary(x => x.IdentityUserId);
+    }
     private Notification Notice(string target, string actor, NotificationType type, string title, string key, Dictionary<string, object>? data = null) => new()
     {
         TargetUserId = target, SourceUserId = actor, Type = type, Title = title, Message = "Open your friends page for the current status.",
@@ -26,7 +40,7 @@ public sealed class SocialCommands(MongoDbContext db, ProfilePolicy profiles, IN
     };
     private Task HandleRequest(IClientSessionHandle session, Friend friend, string recipient, string sender, CancellationToken ct)
     {
-        var filter = Builders<Notification>.Filter.Where(n => n.TargetUserId == recipient && n.SourceUserId == sender && n.Type == NotificationType.FriendRequest) &
+        var filter = Builders<Notification>.Filter.Where(n => n.TargetUserId == recipient && n.SourceUserId == sender && n.Type == NotificationType.FriendRequest && n.Status != NotificationStatus.Handled) &
             (Builders<Notification>.Filter.Eq(n => n.Key, RequestKey(friend)) | Builders<Notification>.Filter.Eq("Data.requestId", PublicId(friend)));
         return db.Notifications.UpdateManyAsync(session, filter, Builders<Notification>.Update.Set(n => n.Status, NotificationStatus.Handled).Set(n => n.HandledAt, clock.GetUtcNow().UtcDateTime), cancellationToken: ct);
     }
@@ -51,6 +65,7 @@ public sealed class SocialCommands(MongoDbContext db, ProfilePolicy profiles, IN
         var sender = await profiles.Find(actor); var receiver = await profiles.Find(target);
         var result = await transactions.Run(async (session, ct) =>
         {
+            var current = await TouchProfiles(session, [actor, target], ct); sender = current[actor]; receiver = current[target];
             var key = Pair(sender.Id, receiver.Id);
             var existing = await db.Friends.Find(session, x => x.PairKey == key).FirstOrDefaultAsync(ct);
             if (existing?.Status == FriendStatus.Accepted) throw new ApiProblem(409, "You are already friends.");
@@ -81,6 +96,7 @@ public sealed class SocialCommands(MongoDbContext db, ProfilePolicy profiles, IN
             if (friend.Status != FriendStatus.Pending && friend.Status != status) throw new ApiProblem(409, "The request already has a different response.");
             var sender = await db.Users.Find(session, x => x.Id == friend.UserId).FirstOrDefaultAsync(ct) ?? throw new ApiProblem(404, "Requester no longer exists.");
             if (friend.Status == status) return (friend, sender, notice: (Notification?)null);
+            var current = await TouchProfiles(session, [actor, sender.IdentityUserId], ct); user = current[actor]; sender = current[sender.IdentityUserId];
             friend.Status = status; friend.RespondedAt = clock.GetUtcNow().UtcDateTime; friend.AcceptedAt = status == FriendStatus.Accepted ? friend.RespondedAt : null;
             await db.Friends.ReplaceOneAsync(session, filter, friend, cancellationToken: ct);
             await HandleRequest(session, friend, actor, sender.IdentityUserId, ct);
@@ -109,6 +125,7 @@ public sealed class SocialCommands(MongoDbContext db, ProfilePolicy profiles, IN
             var sender = await db.Users.Find(session, x => x.Id == friend.UserId).FirstOrDefaultAsync(ct) ?? throw new ApiProblem(404, "Requester no longer exists.");
             var recipient = await db.Users.Find(session, x => x.Id == friend.FriendId).FirstOrDefaultAsync(ct) ?? throw new ApiProblem(404, "Recipient no longer exists.");
             if (friend.Status is FriendStatus.Cancelled or FriendStatus.Removed) return (friend, sender, recipient, changed: false, notice: (Notification?)null);
+            var current = await TouchProfiles(session, [sender.IdentityUserId, recipient.IdentityUserId], ct); sender = current[sender.IdentityUserId]; recipient = current[recipient.IdentityUserId]; user = current[actor];
             var cancellation = friend.Status == FriendStatus.Pending;
             friend.Status = cancellation ? FriendStatus.Cancelled : FriendStatus.Removed; friend.RespondedAt = clock.GetUtcNow().UtcDateTime;
             await db.Friends.ReplaceOneAsync(session, filter, friend, cancellationToken: ct);
@@ -125,12 +142,29 @@ public sealed class SocialCommands(MongoDbContext db, ProfilePolicy profiles, IN
         }
         return result.friend.Status;
     }
-    public async Task Follow(string actor, string target, bool follow)
+    public async Task Follow(string actor, string target, bool follow, CancellationToken cancellationToken = default)
     {
         actor = Account(actor); target = Account(target);
         if (actor == target) throw new ApiProblem(400, "Cannot follow yourself.");
-        await profiles.Find(actor); await profiles.Find(target);
-        if (follow) await db.Follows.UpdateOneAsync(e => e.FollowerId == actor && e.FollowedId == target, Builders<FollowEdge>.Update.SetOnInsert(e => e.FollowerId, actor).SetOnInsert(e => e.FollowedId, target), new UpdateOptions { IsUpsert = true });
-        else await db.Follows.DeleteOneAsync(e => e.FollowerId == actor && e.FollowedId == target);
+        var key = $"follow:{actor}:{target}";
+        var result = await transactions.Run(async (session, ct) =>
+        {
+            var current = await TouchProfiles(session, [actor, target], ct);
+            var filter = Builders<FollowEdge>.Filter.Where(e => e.FollowerId == actor && e.FollowedId == target);
+            if (!follow)
+            {
+                await db.Follows.DeleteOneAsync(session, filter, cancellationToken: ct);
+                var handled = await db.Notifications.UpdateManyAsync(session, x => x.Key == key && x.Type == NotificationType.Follow && x.Status != NotificationStatus.Handled, Builders<Notification>.Update.Set(x => x.Status, NotificationStatus.Handled).Set(x => x.HandledAt, Now), cancellationToken: ct);
+                return (notice: (Notification?)null, changed: handled.ModifiedCount > 0);
+            }
+            if (await db.Follows.Find(session, filter).AnyAsync(ct)) return (notice: (Notification?)null, changed: false);
+            await db.Follows.InsertOneAsync(session, new FollowEdge { FollowerId = actor, FollowedId = target, CreatedAt = Now }, cancellationToken: ct);
+            // One attention record per relationship; repeated follow/unfollow cycles do not spam.
+            if (await db.Notifications.Find(session, x => x.Key == key).AnyAsync(ct)) return (notice: (Notification?)null, changed: false);
+            var notice = await notifications.PersistAsync(session, new Notification { TargetUserId = target, SourceUserId = actor, Type = NotificationType.Follow, Title = $"{current[actor].UserName} followed you", Message = current[actor].IsPrivate ? "Open your profile to view your followers." : "Open their profile to view your new follower.", Key = key, Data = new() { ["followerId"] = actor, ["followedId"] = target }, ActionUrl = $"/user/{(current[actor].IsPrivate ? target : actor)}", CreatedAt = Now }, ct);
+            return (notice: (Notification?)notice, changed: false);
+        }, cancellationToken);
+        if (result.notice != null) await PublishCommitted(ct => notifications.PublishAsync(result.notice).WaitAsync(ct));
+        if (result.changed) await PublishCommitted(ct => notifications.RefreshCountAsync(target).WaitAsync(ct));
     }
 }

@@ -9,7 +9,11 @@ public class ChatHub(ChatCommands commands, IActiveChatTrackingService active) :
     private string Actor => Input.Actor(Context.User!);
     public override async Task OnConnectedAsync() { await Groups.AddToGroupAsync(Context.ConnectionId, $"chat_user_{Actor}"); await base.OnConnectedAsync(); }
     public override async Task OnDisconnectedAsync(Exception? exception) { active.RemoveUserFromAllChats(Actor, Context.ConnectionId); await base.OnDisconnectedAsync(exception); }
-    public async Task JoinChat(string chatId) { var chat = await commands.Member(Actor, chatId, Context.ConnectionAborted); await Groups.AddToGroupAsync(Context.ConnectionId, $"chat_{chat.Id}", Context.ConnectionAborted); active.AddUserToChat(chat.Id, Actor, Context.ConnectionId); await Clients.Caller.SendAsync("ChatJoined", chat.Id, Context.ConnectionAborted); }
+    public Task JoinChat(string chatId) => JoinChatWithVisibility(chatId, true);
+    public async Task JoinChatWithVisibility(string chatId, bool isVisible) { var chat = await commands.Member(Actor, chatId, Context.ConnectionAborted); await Groups.AddToGroupAsync(Context.ConnectionId, $"chat_{chat.Id}", Context.ConnectionAborted); SetActivity(chat.Id, isVisible); await Clients.Caller.SendAsync("ChatJoined", chat.Id, Context.ConnectionAborted); }
+    // Visibility affects attention notices only. Personal message delivery stays subscribed.
+    public async Task SetChatActive(string chatId, bool isVisible) { var chat = await commands.Member(Actor, chatId, Context.ConnectionAborted); SetActivity(chat.Id, isVisible); }
+    private void SetActivity(string chatId, bool isVisible) { if (isVisible) active.AddUserToChat(chatId, Actor, Context.ConnectionId); else active.RemoveUserFromChat(chatId, Actor, Context.ConnectionId); }
     // Leaving only removes this connection's membership; it remains safe after chat deletion.
     public async Task LeaveChat(string chatId) { Input.ObjectId(chatId); chatId = ObjectId.Parse(chatId).ToString(); active.RemoveUserFromChat(chatId, Actor, Context.ConnectionId); await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"chat_{chatId}", Context.ConnectionAborted); }
     public async Task<object> SendMessage(string chatId, string content, string? clientMessageId = null) { var dto = await commands.Send(Actor, chatId, content, clientMessageId, cancellationToken: Context.ConnectionAborted); await Clients.Caller.SendAsync("MessageSent", dto, Context.ConnectionAborted); return dto; }

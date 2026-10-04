@@ -132,11 +132,13 @@ public class DependencyHandler : HttpMessageHandler
 {
     public HttpStatusCode SessionStatus { get; set; } = HttpStatusCode.NoContent;
     public HttpStatusCode SongStatus { get; set; } = HttpStatusCode.OK;
+    public HttpStatusCode PlaylistDeleteStatus { get; set; } = HttpStatusCode.OK;
     public string Artist { get; set; } = "Test artist";
     public int SongDuration { get; set; } = 125;
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         if (request.RequestUri!.AbsolutePath.Contains("/sessions/")) return Task.FromResult(new HttpResponseMessage(SessionStatus));
+        if (request.RequestUri.AbsolutePath.StartsWith("/api/playlists/internal/owner/", StringComparison.Ordinal)) return Task.FromResult(new HttpResponseMessage(PlaylistDeleteStatus));
         if (request.RequestUri.AbsolutePath.Contains("/api/songs/"))
         {
             if (request.RequestUri.AbsolutePath.Split('/').Last() != UserFactory.Song) return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));

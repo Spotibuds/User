@@ -1,16 +1,18 @@
 using Microsoft.AspNetCore.Mvc;
-using MongoDB.Driver;
-using User.Data;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
 using User.Services;
 namespace User.Controllers;
 [ApiController, Route("api/notifications")]
-public class NotificationsController(MongoDbContext db, INotificationService notifications) : ControllerBase
+public class NotificationsController(NotificationCommands commands) : ControllerBase
 {
-    [HttpGet("{userId}")] public async Task<object> Get(string userId, int limit = 50, int skip = 0) { Input.Owner(User, userId); var list = await notifications.GetUserNotificationsAsync(userId, limit, skip); return new { notifications = list.Select(NotificationService.Dto), totalCount = await db.Notifications.CountDocumentsAsync(n => n.TargetUserId == userId && (n.ExpiresAt == null || n.ExpiresAt > DateTime.UtcNow)), unreadCount = await notifications.GetUnreadCountAsync(userId) }; }
-    [HttpPost("{id}/read")] public async Task<object> Read(string id) { await notifications.MarkAsReadAsync(id, Input.Actor(User)); return new { message = "Notification read" }; }
-    [HttpPost("{id}/handle")] public async Task<object> Handle(string id) { await notifications.MarkAsHandledAsync(id, Input.Actor(User)); return new { message = "Notification handled" }; }
-    [HttpPost("{userId}/read-all")] public async Task<object> ReadAll(string userId) { Input.Owner(User, userId); await notifications.MarkAllAsReadAsync(userId); return new { message = "Notifications read" }; }
-    [HttpDelete("{userId}/cleanup")] public async Task<object> Cleanup(string userId, int daysOld = 30) { Input.Owner(User, userId); await notifications.CleanupOldNotificationsAsync(userId, daysOld); return new { message = "Notifications cleaned" }; }
-    [HttpDelete("{id}")] public async Task<object> Delete(string id, string? userId = null) { Input.ObjectId(id); var actor = Input.Actor(User); var result = await db.Notifications.DeleteOneAsync(x => x.Id == id && x.TargetUserId == actor); if (result.DeletedCount == 0) throw new ApiProblem(404, "Notification not found."); return new { message = "Notification deleted" }; }
-    [HttpDelete("{userId}/all")] public async Task<object> DeleteAll(string userId) { Input.Owner(User, userId); await db.Notifications.DeleteManyAsync(x => x.TargetUserId == userId); return new { message = "Notifications deleted" }; }
+    private string Actor => SocialCommands.Account(Input.Actor(User));
+    private string Owner(string userId) { userId = SocialCommands.Account(userId); if (userId != Actor) throw new ApiProblem(403, "This action belongs to another account."); return userId; }
+    [HttpGet("{userId}")] public Task<NotificationSnapshot> Get(string userId, int limit = 50, int skip = 0, string? before = null) => commands.Snapshot(Owner(userId), limit, skip, before);
+    [HttpGet("{userId}/unread-count")] public async Task<object> Count(string userId) => new { unreadCount = await commands.Unread(Owner(userId)) };
+    [HttpPost("{id}/read")] public Task<NotificationAcknowledgement> Read(string id) => commands.Read(id, Actor);
+    [HttpPost("{id}/handle")] public Task<NotificationAcknowledgement> Handle(string id) => commands.Read(id, Actor, handled: true);
+    [HttpPost("{userId}/read-all")] public Task<NotificationAcknowledgement> ReadAll(string userId, [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] NotificationBoundary? boundary = null) => commands.ReadAll(Owner(userId), boundary?.ThroughId);
+    [HttpDelete("{userId}/cleanup")] public Task<NotificationAcknowledgement> Cleanup(string userId, int daysOld = 30) => commands.Cleanup(Owner(userId), daysOld);
+    [HttpDelete("{id}")] public Task<NotificationAcknowledgement> Delete(string id, string? userId = null) { if (userId != null) Owner(userId); return commands.Dismiss(id, Actor); }
+    [HttpDelete("{userId}/all")] public Task<NotificationAcknowledgement> DeleteAll(string userId, [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] NotificationBoundary? boundary = null) => commands.DismissAll(Owner(userId), boundary?.ThroughId);
 }

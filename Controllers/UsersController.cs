@@ -8,7 +8,7 @@ using User.Models;
 using User.Services;
 namespace User.Controllers;
 [ApiController, Route("api/users")]
-public class UsersController(MongoDbContext db, ProfilePolicy profiles, IHttpClientFactory clients, IAzureBlobService blobs, HistoryService history, IConfiguration config, MongoTransactions transactions) : ControllerBase
+public class UsersController(MongoDbContext db, ProfilePolicy profiles, IHttpClientFactory clients, IAzureBlobService blobs, HistoryService history, IConfiguration config, MongoTransactions transactions, INotificationService notifications, TimeProvider clock, ILogger<UsersController> logger) : ControllerBase
 {
     [HttpGet("health"), AllowAnonymous] public object Health() => new { status = "alive", readiness = "/health/ready" };
     private async Task<object> Dto(Models.User user, bool summary = false, bool includeGraph = true)
@@ -123,25 +123,57 @@ public class UsersController(MongoDbContext db, ProfilePolicy profiles, IHttpCli
     public async Task<IActionResult> Cleanup(string identityUserId)
     {
         if (!Input.Service(HttpContext, config)) return Unauthorized(); Input.GuidId(identityUserId);
-        var user = await db.Users.Find(x => x.IdentityUserId == identityUserId).FirstOrDefaultAsync();
+        identityUserId = Guid.Parse(identityUserId).ToString();
         using var musicRequest = new HttpRequestMessage(HttpMethod.Delete, $"api/playlists/internal/owner/{identityUserId}");
         musicRequest.Headers.Add("X-Spotibuds-Service", config["ServiceAuth:Secret"]);
         using var musicResponse = await clients.CreateClient("Music").SendAsync(musicRequest);
         if (!musicResponse.IsSuccessStatusCode) throw new ApiProblem(503, "Playlist deletion is pending. Retry account reconciliation.");
-        if (user != null)
+        var result = await transactions.Run(async (session, ct) =>
         {
-            var chats = await db.Chats.Find(x => x.Participants.Contains(user.Id)).Limit(100).Project(x => x.Id).ToListAsync();
-            await transactions.Run(async (session, ct) => { await db.Messages.DeleteManyAsync(session, x => chats.Contains(x.ChatId), cancellationToken: ct); await db.Chats.DeleteManyAsync(session, x => chats.Contains(x.Id), cancellationToken: ct); return true; }, HttpContext.RequestAborted);
-            if (await db.Chats.Find(x => x.Participants.Contains(user.Id)).AnyAsync()) throw new ApiProblem(503, "Account cleanup is progressing in bounded batches. Reconciliation will retry.");
-            await db.Friends.DeleteManyAsync(x => x.UserId == user.Id || x.FriendId == user.Id);
+            var user = await db.Users.Find(session, x => x.IdentityUserId == identityUserId).FirstOrDefaultAsync(ct);
+            var chats = new List<string>();
+            if (user != null)
+            {
+                // Producers lock the same profiles before inserting their parent and notice.
+                // A real write makes a concurrent insertion retry against the deleted profile.
+                var previousUpdate = user.UpdatedAt ?? user.CreatedAt;
+                var updated = DateTimeOffset.FromUnixTimeMilliseconds(Math.Max(clock.GetUtcNow().ToUnixTimeMilliseconds(), new DateTimeOffset(previousUpdate, TimeSpan.Zero).ToUnixTimeMilliseconds() + 1)).UtcDateTime;
+                await db.Users.UpdateOneAsync(session, x => x.Id == user.Id, Builders<Models.User>.Update.Set(x => x.UpdatedAt, updated), cancellationToken: ct);
+                chats = await db.Chats.Find(session, x => x.Participants.Contains(user.Id)).SortBy(x => x.Id).Limit(100).Project(x => x.Id).ToListAsync(ct);
+            }
+            var noticeFilter = Builders<Notification>.Filter.In("Data.chatId", chats);
+            var progressing = user != null && await db.Chats.Find(session, x => x.Participants.Contains(user.Id) && !chats.Contains(x.Id)).AnyAsync(ct);
+            if (!progressing)
+            {
+                var posts = await db.Feed.Find(session, x => x.IdentityUserId == identityUserId || x.WithIdentityUserId == identityUserId).Project(x => x.Id).ToListAsync(ct);
+                noticeFilter |= Builders<Notification>.Filter.Eq(x => x.SourceUserId, identityUserId) | Builders<Notification>.Filter.Eq(x => x.TargetUserId, identityUserId) | Builders<Notification>.Filter.In("Data.postId", posts);
+                await db.Reactions.DeleteManyAsync(session, x => x.FromIdentityUserId == identityUserId || x.ToIdentityUserId == identityUserId || (x.PostId != null && posts.Contains(x.PostId)), cancellationToken: ct);
+                await db.Feed.DeleteManyAsync(session, x => x.IdentityUserId == identityUserId || x.WithIdentityUserId == identityUserId, cancellationToken: ct);
+                await db.History.DeleteManyAsync(session, x => x.IdentityUserId == identityUserId, cancellationToken: ct);
+                await db.Follows.DeleteManyAsync(session, x => x.FollowerId == identityUserId || x.FollowedId == identityUserId, cancellationToken: ct);
+                if (user != null)
+                {
+                    await db.Friends.DeleteManyAsync(session, x => x.UserId == user.Id || x.FriendId == user.Id, cancellationToken: ct);
+                    if (user.AvatarUrl != null)
+                        await db.AvatarCleanup.UpdateOneAsync(session, x => x.Url == user.AvatarUrl, Builders<AvatarCleanupIntent>.Update.SetOnInsert(x => x.Url, user.AvatarUrl).Set(x => x.DueAt, clock.GetUtcNow().UtcDateTime), new UpdateOptions { IsUpsert = true }, ct);
+                    await db.Users.DeleteOneAsync(session, x => x.Id == user.Id, cancellationToken: ct);
+                }
+            }
+            var recipients = await db.Notifications.Find(session, noticeFilter).Project(x => x.TargetUserId).ToListAsync(ct);
+            await db.Notifications.DeleteManyAsync(session, noticeFilter, cancellationToken: ct);
+            await db.Messages.DeleteManyAsync(session, x => chats.Contains(x.ChatId), cancellationToken: ct);
+            await db.Chats.DeleteManyAsync(session, x => chats.Contains(x.Id), cancellationToken: ct);
+            return (Progressing: progressing, AvatarUrl: progressing ? null : user?.AvatarUrl, Recipients: recipients.Distinct().ToArray());
+        }, HttpContext.RequestAborted);
+        try { await Task.WhenAll(result.Recipients.Select(notifications.RefreshCountAsync)).WaitAsync(TimeSpan.FromSeconds(2)); }
+        catch (Exception) { logger.LogWarning("Committed account cleanup notification refresh is pending."); }
+        if (result.Progressing) throw new ApiProblem(503, "Account cleanup is progressing in bounded batches. Reconciliation will retry.");
+        if (result.AvatarUrl != null)
+        {
+            try { await blobs.Cleanup(result.AvatarUrl).WaitAsync(TimeSpan.FromSeconds(2)); }
+            catch (Exception) { logger.LogWarning("Committed account avatar cleanup will be retried from its durable intent."); }
         }
-        await db.Follows.DeleteManyAsync(x => x.FollowerId == identityUserId || x.FollowedId == identityUserId);
-        await db.Feed.DeleteManyAsync(x => x.IdentityUserId == identityUserId || x.WithIdentityUserId == identityUserId);
-        await db.History.DeleteManyAsync(x => x.IdentityUserId == identityUserId);
-        await db.Reactions.DeleteManyAsync(x => x.FromIdentityUserId == identityUserId || x.ToIdentityUserId == identityUserId);
-        await db.Notifications.DeleteManyAsync(x => x.SourceUserId == identityUserId || x.TargetUserId == identityUserId);
-        if (user?.AvatarUrl != null) await blobs.Cleanup(user.AvatarUrl);
-        if (user != null) await db.Users.DeleteOneAsync(x => x.Id == user.Id); return NoContent();
+        return NoContent();
     }
     public class BatchUserRequest { public List<string> UserIds { get; set; } = []; }
     public class IdentityUsers { public List<IdentityUserDto> Users { get; set; } = []; }

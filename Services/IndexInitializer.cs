@@ -5,12 +5,36 @@ namespace User.Services;
 public sealed class IndexState { public volatile bool Ready; }
 public sealed class IndexInitializer(MongoDbContext db, ILogger<IndexInitializer> logger, IndexState state) : BackgroundService
 {
+    public static Task<UpdateResult> MigrateNotificationTimestamps(MongoDbContext db, CancellationToken ct = default)
+    {
+        // Old notifications shadowed BaseEntity.CreatedAt and stored both fields.
+        // The capitalized field was the producer's timestamp; retain it atomically.
+        var collection = db.Database.GetCollection<MongoDB.Bson.BsonDocument>("notifications");
+        var filter = new MongoDB.Bson.BsonDocument("CreatedAt", new MongoDB.Bson.BsonDocument("$type", "date"));
+        var pipeline = new MongoDB.Bson.BsonDocument[] {
+            new("$set", new MongoDB.Bson.BsonDocument("createdAt", "$CreatedAt")),
+            new("$unset", "CreatedAt")
+        };
+        return collection.UpdateManyAsync(filter, new PipelineUpdateDefinition<MongoDB.Bson.BsonDocument>(pipeline), cancellationToken: ct);
+    }
+
+    public static async Task EnsureNotificationTimeline(MongoDbContext db, CancellationToken ct = default)
+    {
+        using var cursor = await db.Notifications.Indexes.ListAsync(ct);
+        var existing = (await cursor.ToListAsync(ct)).FirstOrDefault(x => x["name"] == "notification_timeline");
+        var legacy = new MongoDB.Bson.BsonDocument { { "TargetUserId", 1 }, { "CreatedAt", -1 }, { "_id", -1 } };
+        if (existing != null && existing["key"].AsBsonDocument == legacy)
+            await db.Notifications.Indexes.DropOneAsync("notification_timeline", ct);
+        await db.Notifications.Indexes.CreateOneAsync(new CreateIndexModel<Notification>(Builders<Notification>.IndexKeys.Ascending(x => x.TargetUserId).Descending(x => x.CreatedAt).Descending(x => x.Id), new CreateIndexOptions { Name = "notification_timeline" }), cancellationToken: ct);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         for (int attempt = 1; attempt <= 12 && !stoppingToken.IsCancellationRequested; attempt++)
         {
             try
             {
+                await MigrateNotificationTimestamps(db, stoppingToken);
                 await db.Users.Indexes.CreateOneAsync(new CreateIndexModel<Models.User>(Builders<Models.User>.IndexKeys.Ascending(x => x.IdentityUserId), new CreateIndexOptions { Unique = true, Name = "identity_user_unique" }), cancellationToken: stoppingToken);
                 await db.Friends.Indexes.CreateOneAsync(new CreateIndexModel<Friend>(Builders<Friend>.IndexKeys.Ascending(x => x.PairKey), new CreateIndexOptions { Unique = true }), cancellationToken: stoppingToken);
                 await db.Friends.Indexes.CreateOneAsync(new CreateIndexModel<Friend>(Builders<Friend>.IndexKeys.Ascending(x => x.RequestId), new CreateIndexOptions { Unique = true, Sparse = true, Name = "friend_request_identity" }), cancellationToken: stoppingToken);
@@ -29,6 +53,7 @@ public sealed class IndexInitializer(MongoDbContext db, ILogger<IndexInitializer
                 await db.History.Indexes.CreateOneAsync(new CreateIndexModel<HistoryEvent>(Builders<HistoryEvent>.IndexKeys.Ascending(x => x.IdentityUserId).Descending(x => x.PlayedAt)), cancellationToken: stoppingToken);
                 await db.History.Indexes.CreateOneAsync(new CreateIndexModel<HistoryEvent>(Builders<HistoryEvent>.IndexKeys.Ascending(x => x.PlayedAt), new CreateIndexOptions { ExpireAfter = TimeSpan.FromDays(90) }), cancellationToken: stoppingToken);
                 await db.Notifications.Indexes.CreateOneAsync(new CreateIndexModel<Notification>(Builders<Notification>.IndexKeys.Ascending(x => x.TargetUserId).Descending(x => x.CreatedAt)), cancellationToken: stoppingToken);
+                await EnsureNotificationTimeline(db, stoppingToken);
                 await db.Notifications.Indexes.CreateOneAsync(new CreateIndexModel<Notification>(Builders<Notification>.IndexKeys.Ascending(x => x.Key), new CreateIndexOptions { Unique = true, Sparse = true }), cancellationToken: stoppingToken);
                 await db.AvatarCleanup.Indexes.CreateOneAsync(new CreateIndexModel<AvatarCleanupIntent>(Builders<AvatarCleanupIntent>.IndexKeys.Ascending(x => x.Url), new CreateIndexOptions { Unique = true }), cancellationToken: stoppingToken);
                 await db.AvatarCleanup.Indexes.CreateOneAsync(new CreateIndexModel<AvatarCleanupIntent>(Builders<AvatarCleanupIntent>.IndexKeys.Ascending(x => x.DueAt).Ascending(x => x.Attempts)), cancellationToken: stoppingToken);

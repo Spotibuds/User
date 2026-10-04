@@ -51,6 +51,7 @@ builder.Services.AddHttpClient("Music", client => { client.BaseAddress = new Uri
 builder.Services.AddScoped<ProfilePolicy>();
 builder.Services.AddScoped<SessionValidator>();
 builder.Services.AddScoped<INotificationService, NotificationService>();
+builder.Services.AddScoped<NotificationCommands>();
 builder.Services.AddScoped<SocialCommands>();
 builder.Services.AddScoped<ChatCommands>();
 builder.Services.AddSingleton<MongoTransactions>();

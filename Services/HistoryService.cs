@@ -36,6 +36,11 @@ public sealed class HistoryService(MongoDbContext db, TimeProvider clock, MongoT
         var item = new HistoryEvent { IdentityUserId = actor, SongId = dto.SongId, SongTitle = dto.SongTitle.Trim(), Artist = dto.Artist.Trim(), Duration = dto.Duration, CoverUrl = dto.CoverUrl, PlayedAt = clock.GetUtcNow().UtcDateTime };
         await transactions.Run(async (session, token) =>
         {
+            var author = await db.Users.Find(session, x => x.IdentityUserId == actor).FirstOrDefaultAsync(token) ?? throw new ApiProblem(404, "Profile no longer exists.");
+            var now = DateTimeOffset.FromUnixTimeMilliseconds(clock.GetUtcNow().ToUnixTimeMilliseconds()).UtcDateTime;
+            var stamp = author.UpdatedAt is DateTime previous && previous >= now ? previous.AddMilliseconds(1) : now;
+            var touched = await db.Users.UpdateOneAsync(session, x => x.Id == author.Id && x.IdentityUserId == actor, Builders<Models.User>.Update.Set(x => x.UpdatedAt, stamp), cancellationToken: token);
+            if (touched.MatchedCount != 1) throw new ApiProblem(404, "Profile no longer exists.");
             await db.History.InsertOneAsync(session, item, cancellationToken: token);
             var key = $"recent_song:{actor}:{dto.SongId}";
             var post = await db.Feed.FindOneAndUpdateAsync(session, Builders<FeedItem>.Filter.Eq(x => x.Key, key), Builders<FeedItem>.Update.SetOnInsert(x => x.IdentityUserId, actor).SetOnInsert(x => x.Type, "recent_song").SetOnInsert(x => x.Key, key).Set(x => x.SongId, dto.SongId).Set(x => x.SongTitle, dto.SongTitle).Set(x => x.Artist, dto.Artist).Set(x => x.CoverUrl, dto.CoverUrl).Set(x => x.PlayedAt, item.PlayedAt), new FindOneAndUpdateOptions<FeedItem> { IsUpsert = true, ReturnDocument = ReturnDocument.After }, token);

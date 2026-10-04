@@ -105,12 +105,11 @@ public sealed class ChatCommands(MongoDbContext db, ProfilePolicy profiles, IHub
         // Recognize older clients' valid alternative GUID formats as the same retry key.
         var formats = new[] { "D", "N", "B", "P" }.Select(format => Regex.Escape(clientGuid.ToString(format)));
         var nonce = Builders<Message>.Filter.Regex(x => x.ClientMessageId, new BsonRegularExpression("^(?:" + string.Join('|', formats) + ")$", "i"));
-        List<Models.User> participants;
+        List<Models.User> participants = [];
         (Message message, List<Notification> notices, bool inserted) result;
         await Gate.WaitAsync(cancellationToken);
         try
         {
-            participants = await db.Users.Find(x => chat.Participants.Contains(x.Id)).ToListAsync(cancellationToken);
             result = await transactions.Run(async (session, ct) =>
             {
                 var currentChat = await db.Chats.Find(session, x => x.Id == id && x.Participants.Contains(sender.Id)).FirstOrDefaultAsync(ct) ?? throw new ApiProblem(404, "Chat no longer exists.");
@@ -119,6 +118,16 @@ public sealed class ChatCommands(MongoDbContext db, ProfilePolicy profiles, IHub
                 {
                     if (message.Content != content || message.ReplyToId != replyToId) throw new ApiProblem(409, "Message identifier was already used for different content.");
                     return (message, new List<Notification>(), false);
+                }
+                participants = await db.Users.Find(session, x => currentChat.Participants.Contains(x.Id)).ToListAsync(ct);
+                if (participants.Count != currentChat.Participants.Count) throw new ApiProblem(404, "A participant profile is missing.");
+                sender = participants.Single(x => x.IdentityUserId == actor);
+                foreach (var participant in participants.OrderBy(x => x.Id, StringComparer.Ordinal))
+                {
+                    // Even a suppressed notice must serialize the parent message against account cleanup.
+                    var touchedAt = participant.UpdatedAt is DateTime previous && previous >= Now ? previous.AddMilliseconds(1) : Now;
+                    var touched = await db.Users.UpdateOneAsync(session, x => x.Id == participant.Id && x.IdentityUserId == participant.IdentityUserId, Builders<Models.User>.Update.Set(x => x.UpdatedAt, touchedAt), cancellationToken: ct);
+                    if (touched.MatchedCount != 1) throw new ApiProblem(404, "A participant profile is missing.");
                 }
                 if (replyToId != null && !await db.Messages.Find(session, x => x.Id == replyToId && x.ChatId == id).AnyAsync(ct)) throw new ApiProblem(400, "Reply message belongs to a different chat.");
                 // Preserve timeline order even if the system clock moves backwards.
@@ -155,6 +164,21 @@ public sealed class ChatCommands(MongoDbContext db, ProfilePolicy profiles, IHub
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         try { await publish(timeout.Token); }
         catch (Exception ex) { logger.LogWarning("Committed chat event could not be published ({ErrorType}). Clients recover through history.", ex.GetType().Name); }
+    }
+    public async Task Delete(string actor, string id, CancellationToken cancellationToken = default)
+    {
+        var member = await Member(actor, id, cancellationToken); var self = await profiles.Find(actor, cancellationToken);
+        var affected = await transactions.Run(async (session, ct) =>
+        {
+            if (!await db.Chats.Find(session, x => x.Id == member.Id && x.Participants.Contains(self.Id)).AnyAsync(ct)) throw new ApiProblem(404, "Chat no longer exists.");
+            var notices = Builders<Notification>.Filter.Eq(x => x.Type, NotificationType.Message) & Builders<Notification>.Filter.Eq("Data.chatId", member.Id);
+            var recipients = await db.Notifications.Find(session, notices).Project(x => x.TargetUserId).ToListAsync(ct);
+            await db.Notifications.DeleteManyAsync(session, notices, cancellationToken: ct);
+            await db.Messages.DeleteManyAsync(session, x => x.ChatId == member.Id, cancellationToken: ct);
+            await db.Chats.DeleteOneAsync(session, x => x.Id == member.Id && x.Participants.Contains(self.Id), cancellationToken: ct);
+            return recipients.Distinct().ToList();
+        }, cancellationToken);
+        await PublishCommitted(ct => Task.WhenAll(affected.Select(recipient => notifications.RefreshCountAsync(recipient).WaitAsync(ct))));
     }
     private async Task PublishReceipt(Chat chat, string eventName, object payload)
     {

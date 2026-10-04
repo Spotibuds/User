@@ -10,7 +10,9 @@ public enum NotificationType
     FriendRequestDeclined,
     FriendRemoved,
     Message,
-    Other
+    Other,
+    Follow,
+    Reaction
 }
 
 public enum NotificationStatus
@@ -20,6 +22,7 @@ public enum NotificationStatus
     Handled
 }
 
+[BsonIgnoreExtraElements]
 public class Notification : BaseEntity
 {
     [BsonIgnoreIfNull]
@@ -58,9 +61,10 @@ public class Notification : BaseEntity
     /// </summary>
     public DateTime? ExpiresAt { get; set; }
     
-    public new DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-    
     public DateTime? ReadAt { get; set; }
     
     public DateTime? HandledAt { get; set; }
+
+    [BsonIgnoreIfNull]
+    public DateTime? DismissedAt { get; set; }
 }

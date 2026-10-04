@@ -7,7 +7,7 @@ using User.Entities;
 using User.Services;
 namespace User.Controllers;
 [ApiController, Route("api/chats")]
-public class ChatsController(MongoDbContext db, ProfilePolicy profiles, ChatCommands commands, MongoTransactions transactions) : ControllerBase
+public class ChatsController(MongoDbContext db, ProfilePolicy profiles, ChatCommands commands) : ControllerBase
 {
     [HttpPost("create-or-get")] public async Task<object> Create(CreateChatDto dto) => await commands.ChatDto(await commands.Create(Input.Actor(User), dto.ParticipantIds, dto.IsGroup, dto.Name, HttpContext.RequestAborted));
     [HttpGet("{id}")] public async Task<object> Get(string id) => await commands.ChatDto(await commands.Member(Input.Actor(User), id));
@@ -43,7 +43,7 @@ public class ChatsController(MongoDbContext db, ProfilePolicy profiles, ChatComm
         var unread = await db.Messages.Aggregate().Match(x => ids.Contains(x.ChatId) && x.SenderId != user.Id && !x.ReadBy.Any(r => r.UserId == actor)).Group(x => x.ChatId, g => new { ChatId = g.Key, Count = g.Count() }).ToListAsync(); return unread.ToDictionary(x => x.ChatId, x => x.Count);
     }
     [HttpGet("{chatId}/unread-count")] public async Task<object> Count(string chatId) { var actor = Input.Actor(User); await commands.Member(actor, chatId); var user = await profiles.Find(actor); return await db.Messages.CountDocumentsAsync(x => x.ChatId == chatId && x.SenderId != user.Id && !x.ReadBy.Any(r => r.UserId == actor)); }
-    [HttpDelete("{chatId}")] public async Task<object> Delete(string chatId) { await commands.Member(Input.Actor(User), chatId); await transactions.Run(async (session, ct) => { await db.Messages.DeleteManyAsync(session, x => x.ChatId == chatId, cancellationToken: ct); await db.Chats.DeleteOneAsync(session, x => x.Id == chatId, cancellationToken: ct); return true; }, HttpContext.RequestAborted); return new { message = "Chat deleted" }; }
+    [HttpDelete("{chatId}")] public async Task<object> Delete(string chatId) { await commands.Delete(Input.Actor(User), chatId, HttpContext.RequestAborted); return new { message = "Chat deleted" }; }
 }
 public class CreateChatDto { public List<string>? ParticipantIds { get; set; } = []; public bool IsGroup { get; set; } public string? Name { get; set; } }
 public class SendMessageDto { public string Content { get; set; } = ""; public string Type { get; set; } = "Text"; public string? ClientMessageId { get; set; } public string? ReplyToId { get; set; } }

@@ -6,8 +6,8 @@ namespace User.Controllers;
 [ApiController, Route("api/follows")]
 public class FollowsController(MongoDbContext db, ProfilePolicy profiles, SocialCommands commands) : ControllerBase
 {
-    [HttpPost] public async Task<object> Follow(FollowRequestDto dto) { await commands.Follow(Input.Actor(User), dto.FollowedId, true); return new { message = "Following saved" }; }
-    [HttpDelete] public async Task<object> Unfollow(FollowRequestDto dto) { await commands.Follow(Input.Actor(User), dto.FollowedId, false); return new { message = "Following removed" }; }
+    [HttpPost] public async Task<object> Follow(FollowRequestDto dto) { await commands.Follow(Input.Actor(User), dto.FollowedId, true, HttpContext.RequestAborted); return new { message = "Following saved" }; }
+    [HttpDelete] public async Task<object> Unfollow(FollowRequestDto dto) { await commands.Follow(Input.Actor(User), dto.FollowedId, false, HttpContext.RequestAborted); return new { message = "Following removed" }; }
     [HttpGet("{userId}/followers")]
     public async Task<object> Followers(string userId, int limit = 100, int skip = 0)
     {
